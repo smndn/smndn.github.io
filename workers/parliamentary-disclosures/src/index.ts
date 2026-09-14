@@ -361,25 +361,35 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       versionId, PARSER_VERSION, SCHEMA_VERSION, started,
     );
     const runId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
-    const museOut = await callMuseWithRetry(
-      key,
-      { pdfBytes: bytes, pdfFilename: "source.pdf", extractionMethod: "direct_pdf_model" },
-      {
-        politicianName: pol.full_name,
-        chamber: src.chamber || "house",
-        parliament: src.parliament || CURRENT_PARLIAMENT,
-        sourceUrl: src.source_url,
-      },
-      (raw) => {
-        // sync pre-check: must be JSON object; full validation happens after
-        try {
-          const v = JSON.parse(raw);
-          return v && typeof v === "object" && Array.isArray(v.disclosures);
-        } catch {
-          return false;
-        }
-      },
-    );
+    const meta = {
+      politicianName: pol.full_name,
+      chamber: src.chamber || "house",
+      parliament: src.parliament || CURRENT_PARLIAMENT,
+      sourceUrl: src.source_url,
+    };
+    const isJsonish = (raw: string) => {
+      try {
+        const v = JSON.parse(raw);
+        return v && typeof v === "object" && Array.isArray(v.disclosures);
+      } catch {
+        return false;
+      }
+    };
+    let museOut;
+    let extractionMethod: "direct_pdf_model" | "embedded_pdf_text" = "direct_pdf_model";
+    try {
+      museOut = await callMuseWithRetry(
+        key,
+        { pdfBytes: bytes, pdfFilename: "source.pdf", extractionMethod: "direct_pdf_model" },
+        meta,
+        isJsonish,
+      );
+    } catch (err) {
+      const text = extractEmbeddedPdfText(bytes);
+      if (text.length < 80) throw err;
+      extractionMethod = "embedded_pdf_text";
+      museOut = await callMuseWithRetry(key, { text, extractionMethod }, meta, isJsonish);
+    }
     const validated = await validateParsedOutput(museOut.rawText);
     if (!validated.ok || !validated.document) {
       this.ctx.storage.sql.exec(
@@ -407,9 +417,9 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       parseStatus, runId,
     );
     this.ctx.storage.sql.exec(
-      `UPDATE source_versions SET parse_status = ?, parse_confidence = ?, disclosure_count = ?, extraction_method = 'direct_pdf_model',
+      `UPDATE source_versions SET parse_status = ?, parse_confidence = ?, disclosure_count = ?, extraction_method = ?,
         model = ?, model_version = ?, parser_version = ?, schema_version = ?, error_summary = NULL WHERE id = ?`,
-      parseStatus, validated.highConfidence ? 0.9 : 0.5, committed.inserted, museOut.modelVersion, museOut.modelVersion, PARSER_VERSION, SCHEMA_VERSION, versionId,
+      parseStatus, validated.highConfidence ? 0.9 : 0.5, committed.inserted, extractionMethod, museOut.modelVersion, museOut.modelVersion, PARSER_VERSION, SCHEMA_VERSION, versionId,
     );
     return { status: parseStatus, count: committed.inserted };
   }
@@ -487,6 +497,24 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now() + (Number.isFinite(delay) ? delay : 15_000));
     }
   }
+}
+
+function extractEmbeddedPdfText(bytes: ArrayBuffer): string {
+  const raw = new TextDecoder("latin1").decode(bytes);
+  const out: string[] = [];
+  const re = /\((?:\\.|[^\\)]){2,}\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const t = m[0]
+      .slice(1, -1)
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "")
+      .replace(/\\\(/g, "(")
+      .replace(/\\\)/g, ")")
+      .replace(/\\\\/g, "\\");
+    if (/[A-Za-z]{3}/.test(t)) out.push(t);
+  }
+  return out.join("\n").slice(0, 180_000);
 }
 
 function hashStr(s: string): number {
