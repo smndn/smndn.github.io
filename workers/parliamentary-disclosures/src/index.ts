@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { SCHEMA_V1 } from "./schema";
+import { callMuseWithRetry, PARSER_VERSION, SCHEMA_VERSION } from "./muse";
+import { commitParsedVersion, validateParsedOutput } from "./disclosure-parse";
 
 export interface Env {
   PARLIAMENTARY_DISCLOSURES: DurableObjectNamespace<ParliamentaryDisclosures>;
@@ -295,7 +297,99 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
        VALUES (?, ?, ?, ?, ?, ?, 'pending_parse')`,
       sourceId, fetchedAt, sha256, length, etag, lastModified,
     );
+    const versionId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO ingestion_jobs (job_type, source_id, source_url, status) VALUES ('parse_version', ?, ?, 'pending')`,
+      sourceId, `${sourceUrl}#v=${versionId}`,
+    );
     return { sha256, skipped: false };
+  }
+
+  async parseVersion(sourceId: number, sourceUrl: string): Promise<{ status: string; count: number }> {
+    const key = this.env.MUSE_API_KEY;
+    if (!key) throw new Error("MUSE_API_KEY missing");
+    const versionMatch = sourceUrl.match(/#v=(\d+)/);
+    const versionId = versionMatch ? Number(versionMatch[1]) : this.ctx.storage.sql
+      .exec<{ id: number }>(`SELECT id FROM source_versions WHERE source_id = ? ORDER BY id DESC LIMIT 1`, sourceId)
+      .one().id;
+    const src = this.ctx.storage.sql
+      .exec<{ source_url: string; politician_id: number | null; parliament: number | null; chamber: string | null }>(
+        `SELECT source_url, politician_id, parliament, chamber FROM sources WHERE id = ?`,
+        sourceId,
+      )
+      .one();
+    const pol = src.politician_id
+      ? this.ctx.storage.sql.exec<{ full_name: string }>(`SELECT full_name FROM politicians WHERE id = ?`, src.politician_id).one()
+      : { full_name: "unknown" };
+    const existing = this.ctx.storage.sql
+      .exec<{ parse_status: string }>(`SELECT parse_status FROM source_versions WHERE id = ?`, versionId)
+      .one();
+    if (existing.parse_status === "success" || existing.parse_status === "success_needs_review") {
+      return { status: existing.parse_status, count: 0 };
+    }
+    const res = await fetch(src.source_url, {
+      headers: { "user-agent": FETCH_UA, accept: "application/pdf,*/*" },
+    });
+    if (!res.ok) throw new Error(`parse refetch HTTP ${res.status}`);
+    const bytes = await res.arrayBuffer();
+    const started = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO parser_runs (source_version_id, model, parser_version, schema_version, started_at, status, input_kind)
+       VALUES (?, 'muse-spark-1.3-contributor', ?, ?, ?, 'parsing', 'direct_pdf_model')`,
+      versionId, PARSER_VERSION, SCHEMA_VERSION, started,
+    );
+    const runId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+    const museOut = await callMuseWithRetry(
+      key,
+      { pdfBytes: bytes, pdfFilename: "source.pdf", extractionMethod: "direct_pdf_model" },
+      {
+        politicianName: pol.full_name,
+        chamber: src.chamber || "house",
+        parliament: src.parliament || CURRENT_PARLIAMENT,
+        sourceUrl: src.source_url,
+      },
+      (raw) => {
+        // sync pre-check: must be JSON object; full validation happens after
+        try {
+          const v = JSON.parse(raw);
+          return v && typeof v === "object" && Array.isArray(v.disclosures);
+        } catch {
+          return false;
+        }
+      },
+    );
+    const validated = await validateParsedOutput(museOut.rawText);
+    if (!validated.ok || !validated.document) {
+      this.ctx.storage.sql.exec(
+        `UPDATE parser_runs SET completed_at = datetime('now'), status = 'failed_validation', error_summary = ? WHERE id = ?`,
+        validated.errors.join("; ").slice(0, 1000), runId,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE source_versions SET parse_status = 'failed_validation', error_summary = ?, model = ?, parser_version = ?, schema_version = ? WHERE id = ?`,
+        validated.errors.join("; ").slice(0, 1000), museOut.modelVersion, PARSER_VERSION, SCHEMA_VERSION, versionId,
+      );
+      throw new Error(`validation failed: ${validated.errors.join("; ")}`);
+    }
+    const exec = (sql: string, ...params: unknown[]) => this.ctx.storage.sql.exec(sql, ...params);
+    const committed = commitParsedVersion(exec, {
+      sourceVersionId: versionId,
+      politicianId: src.politician_id,
+      parliament: src.parliament,
+      chamber: src.chamber,
+      lodgedDate: validated.document.lodged_date ?? null,
+      disclosures: validated.disclosures,
+    });
+    const parseStatus = committed.needsReview || !validated.highConfidence ? "success_needs_review" : "success";
+    this.ctx.storage.sql.exec(
+      `UPDATE parser_runs SET completed_at = datetime('now'), status = ? WHERE id = ?`,
+      parseStatus, runId,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE source_versions SET parse_status = ?, parse_confidence = ?, disclosure_count = ?, extraction_method = 'direct_pdf_model',
+        model = ?, model_version = ?, parser_version = ?, schema_version = ?, error_summary = NULL WHERE id = ?`,
+      parseStatus, validated.highConfidence ? 0.9 : 0.5, committed.inserted, museOut.modelVersion, museOut.modelVersion, PARSER_VERSION, SCHEMA_VERSION, versionId,
+    );
+    return { status: parseStatus, count: committed.inserted };
   }
 
   private failOrRetry(jobId: number, attempts: number, err: string) {
@@ -343,6 +437,12 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
             `UPDATE ingestion_jobs SET status = 'completed', completed_at = datetime('now'), last_error = ? WHERE id = ?`,
             r.skipped ? "skipped_duplicate_version" : null, job.id,
           );
+        } else if (job.job_type === "parse_version" && job.source_id && job.source_url) {
+          const r = await this.parseVersion(job.source_id, job.source_url);
+          this.ctx.storage.sql.exec(
+            `UPDATE ingestion_jobs SET status = 'completed', completed_at = datetime('now'), last_error = ? WHERE id = ?`,
+            `${r.status}:${r.count}`, job.id,
+          );
         } else {
           this.ctx.storage.sql.exec(
             `UPDATE ingestion_jobs SET status = 'failed', completed_at = datetime('now'), last_error = ? WHERE id = ?`,
@@ -389,6 +489,10 @@ export default {
     const stub = env.PARLIAMENTARY_DISCLOSURES.getByName("global");
 
     if (path === "/api/health" || path === "/api/parliamentary-disclosures/health") {
+      const st = await stub.status();
+      if (st.sources === 0 && st.pending_jobs === 0) {
+        await stub.enqueueDiscovery();
+      }
       return json(await stub.status());
     }
     if (path === "/api/parliamentary-disclosures/search" || path === "/api/search") {
