@@ -139,6 +139,11 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
         `SELECT status, COUNT(*) as n FROM ingestion_jobs GROUP BY status`,
       )
       .toArray();
+    const recentErrors = this.ctx.storage.sql
+      .exec<{ job_type: string; last_error: string | null; status: string }>(
+        `SELECT job_type, last_error, status FROM ingestion_jobs WHERE last_error IS NOT NULL ORDER BY id DESC LIMIT 8`,
+      )
+      .toArray();
     return {
       ok: true,
       singleton: "global",
@@ -147,6 +152,7 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       source_versions: q("SELECT COUNT(*) as n FROM source_versions"),
       pending_jobs: q("SELECT COUNT(*) as n FROM ingestion_jobs WHERE status = 'pending'"),
       jobs_by_status: jobsByStatus,
+      recent_errors: recentErrors,
       muse_configured: Boolean(this.env.MUSE_API_KEY),
     };
   }
@@ -171,6 +177,22 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       )
       .toArray();
     return { query, results: rows };
+  }
+
+  async requeueUnknownParseJobs(): Promise<number> {
+    const rows = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM ingestion_jobs WHERE job_type = 'parse_version' AND status = 'failed' AND last_error = 'unknown job_type parse_version'`,
+      )
+      .toArray();
+    for (const r of rows) {
+      this.ctx.storage.sql.exec(
+        `UPDATE ingestion_jobs SET status = 'pending', last_error = NULL, next_retry_at = NULL WHERE id = ?`,
+        r.id,
+      );
+    }
+    if (rows.length > 0) await this.ctx.storage.setAlarm(Date.now() + 1000);
+    return rows.length;
   }
 
   async enqueueDiscovery(): Promise<{ queued: boolean; job_id?: number }> {
@@ -493,6 +515,7 @@ export default {
       if (st.sources === 0 && st.pending_jobs === 0) {
         await stub.enqueueDiscovery();
       }
+      await stub.requeueUnknownParseJobs();
       return json(await stub.status());
     }
     if (path === "/api/parliamentary-disclosures/search" || path === "/api/search") {
