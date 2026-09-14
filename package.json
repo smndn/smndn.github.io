@@ -1,0 +1,23 @@
+{
+  "name": "smndn.github.io",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smndn/smndn.github.io.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/smndn/smndn.github.io/issues"
+  },
+  "homepage": "https://github.com/smndn/smndn.github.io#readme",
+  "devDependencies": {
+    "wrangler": "^4.131.2"
+  }
+}
