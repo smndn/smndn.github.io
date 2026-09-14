@@ -7,6 +7,14 @@ export interface Env {
   ADMIN_SECRET?: string;
 }
 
+const HOUSE_INDEX_URL = "https://www.aph.gov.au/register";
+const APH_ORIGIN = "https://www.aph.gov.au";
+const CURRENT_PARLIAMENT = 48;
+const MAX_ATTEMPTS = 5;
+const BATCH_SIZE = 5;
+const FETCH_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 simondean.xyz-parliamentary-disclosures/1.0";
+
 function json(data: unknown, status = 200, extra: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -16,6 +24,75 @@ function json(data: unknown, status = 200, extra: HeadersInit = {}): Response {
       ...extra,
     },
   });
+}
+
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+function cleanText(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+interface DiscoveredLink {
+  url: string;
+  title: string;
+}
+
+/** Extract official APH document links from register index HTML. */
+export function extractHouseLinks(html: string, base = APH_ORIGIN): DiscoveredLink[] {
+  const out: DiscoveredLink[] = [];
+  const seen = new Set<string>();
+  const re = /<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)<\/a\s*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    let href = (m[1] || "").trim();
+    if (!href || href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("javascript:")) continue;
+    let absolute: string;
+    try {
+      absolute = new URL(href, base).toString();
+    } catch {
+      continue;
+    }
+    if (!absolute.startsWith(APH_ORIGIN)) continue;
+    const lower = absolute.toLowerCase();
+    const looksOfficial =
+      lower.endsWith(".pdf") ||
+      lower.includes("register") ||
+      lower.includes("interest") ||
+      lower.includes("statement") ||
+      lower.includes("declaration") ||
+      lower.includes("members-interest") ||
+      lower.includes("members_interests");
+    if (!looksOfficial) continue;
+    if (seen.has(absolute)) continue;
+    seen.add(absolute);
+    const title = cleanText(m[2] || "").slice(0, 200);
+    out.push({ url: absolute, title });
+  }
+  return out;
+}
+
+function backoffMs(attempts: number): number {
+  return Math.min(60 * 60 * 1000, 30_000 * Math.pow(2, Math.max(0, attempts - 1)));
+}
+
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export class ParliamentaryDisclosures extends DurableObject<Env> {
@@ -42,26 +119,32 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
         "INSERT INTO _sql_schema_migrations (id) VALUES (1)",
       );
     }
+    if (current < 2) {
+      this.ctx.storage.sql.exec(
+        `CREATE INDEX IF NOT EXISTS idx_jobs_status_retry ON ingestion_jobs(status, next_retry_at)`,
+      );
+      this.ctx.storage.sql.exec(
+        "INSERT INTO _sql_schema_migrations (id) VALUES (2)",
+      );
+    }
   }
 
   async status() {
-    const disclosures = this.ctx.storage.sql
-      .exec<{ n: number }>("SELECT COUNT(*) as n FROM disclosures")
-      .one().n;
-    const sources = this.ctx.storage.sql
-      .exec<{ n: number }>("SELECT COUNT(*) as n FROM sources")
-      .one().n;
-    const jobs = this.ctx.storage.sql
-      .exec<{ n: number }>(
-        "SELECT COUNT(*) as n FROM ingestion_jobs WHERE status = 'pending'",
+    const q = (sql: string, ...params: unknown[]): number =>
+      this.ctx.storage.sql.exec<{ n: number }>(sql, ...(params as never[])).one().n;
+    const jobsByStatus = this.ctx.storage.sql
+      .exec<{ status: string; n: number }>(
+        `SELECT status, COUNT(*) as n FROM ingestion_jobs GROUP BY status`,
       )
-      .one().n;
+      .toArray();
     return {
       ok: true,
       singleton: "global",
-      disclosures,
-      sources,
-      pending_jobs: jobs,
+      disclosures: q("SELECT COUNT(*) as n FROM disclosures"),
+      sources: q("SELECT COUNT(*) as n FROM sources"),
+      source_versions: q("SELECT COUNT(*) as n FROM source_versions"),
+      pending_jobs: q("SELECT COUNT(*) as n FROM ingestion_jobs WHERE status = 'pending'"),
+      jobs_by_status: jobsByStatus,
       muse_configured: Boolean(this.env.MUSE_API_KEY),
     };
   }
@@ -88,20 +171,156 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     return { query, results: rows };
   }
 
-  async enqueueDiscovery(): Promise<{ queued: boolean }> {
-    this.ctx.storage.sql.exec(
-      `INSERT INTO ingestion_jobs (job_type, status) VALUES ('discover_house', 'pending')`,
-    );
+  async enqueueDiscovery(): Promise<{ queued: boolean; job_id?: number }> {
+    const existing = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM ingestion_jobs WHERE job_type = 'discover_house' AND status IN ('pending','running') ORDER BY id DESC LIMIT 1`,
+      )
+      .toArray();
+    if (existing.length > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1000);
+      return { queued: false, job_id: existing[0].id };
+    }
+    const rows = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        `INSERT INTO ingestion_jobs (job_type, source_url, status) VALUES ('discover_house', ?, 'pending')`,
+        HOUSE_INDEX_URL,
+      )
+      .toArray();
+    void rows;
+    const id = this.ctx.storage.sql
+      .exec<{ id: number }>(`SELECT last_insert_rowid() as id`)
+      .one().id;
     await this.ctx.storage.setAlarm(Date.now() + 1000);
-    return { queued: true };
+    return { queued: true, job_id: id };
+  }
+
+  private upsertSource(link: DiscoveredLink): { sourceId: number; isNew: boolean } {
+    const now = new Date().toISOString();
+    const name = link.title || link.url;
+    const slug = slugify(name) || `member-${Math.abs(hashStr(link.url))}`;
+    const existingPol = this.ctx.storage.sql
+      .exec<{ id: number }>(`SELECT id FROM politicians WHERE slug = ?`, slug)
+      .toArray();
+    let politicianId: number;
+    if (existingPol.length > 0) {
+      politicianId = existingPol[0].id;
+      this.ctx.storage.sql.exec(`UPDATE politicians SET last_seen_at = ?, active = 1 WHERE id = ?`, now, politicianId);
+    } else {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO politicians (slug, full_name, chamber, first_seen_at, last_seen_at, active)
+         VALUES (?, ?, 'house', ?, ?, 1)`,
+        slug, name.slice(0, 200), now, now,
+      );
+      politicianId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+    }
+    const existingSrc = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM sources WHERE source_url = ? AND parliament = ? AND chamber = 'house'`,
+        link.url, CURRENT_PARLIAMENT,
+      )
+      .toArray();
+    if (existingSrc.length > 0) {
+      const sourceId = existingSrc[0].id;
+      this.ctx.storage.sql.exec(
+        `UPDATE sources SET last_seen_at = ?, source_title = COALESCE(?, source_title), politician_id = COALESCE(politician_id, ?) WHERE id = ?`,
+        now, link.title || null, politicianId, sourceId,
+      );
+      return { sourceId, isNew: false };
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO sources (politician_id, parliament, chamber, source_url, source_title, first_seen_at, last_seen_at)
+       VALUES (?, ?, 'house', ?, ?, ?, ?)`,
+      politicianId, CURRENT_PARLIAMENT, link.url, link.title || null, now, now,
+    );
+    const sourceId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+    return { sourceId, isNew: true };
+  }
+
+  private enqueueFetch(sourceId: number, sourceUrl: string): boolean {
+    const existing = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM ingestion_jobs WHERE job_type = 'fetch_source' AND source_id = ? AND status IN ('pending','running') LIMIT 1`,
+        sourceId,
+      )
+      .toArray();
+    if (existing.length > 0) return false;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO ingestion_jobs (job_type, source_id, source_url, status) VALUES ('fetch_source', ?, ?, 'pending')`,
+      sourceId, sourceUrl,
+    );
+    return true;
+  }
+
+  async discoverHouse(): Promise<{ sources_seen: number; sources_new: number; jobs_queued: number }> {
+    const res = await fetch(HOUSE_INDEX_URL, {
+      headers: { "user-agent": FETCH_UA, accept: "text/html,application/xhtml+xml" },
+    });
+    if (!res.ok) throw new Error(`house index HTTP ${res.status}`);
+    const html = await res.text();
+    const links = extractHouseLinks(html, APH_ORIGIN);
+    if (links.length === 0) throw new Error("house index parsed 0 official links");
+    let sourcesNew = 0;
+    let jobsQueued = 0;
+    for (const link of links) {
+      const { sourceId, isNew } = this.upsertSource(link);
+      if (isNew) sourcesNew++;
+      if (this.enqueueFetch(sourceId, link.url)) jobsQueued++;
+    }
+    return { sources_seen: links.length, sources_new: sourcesNew, jobs_queued: jobsQueued };
+  }
+
+  async fetchSource(sourceId: number, sourceUrl: string): Promise<{ sha256: string; skipped: boolean }> {
+    const res = await fetch(sourceUrl, {
+      headers: { "user-agent": FETCH_UA, accept: "application/pdf,*/*" },
+    });
+    if (!res.ok) throw new Error(`source fetch HTTP ${res.status} for ${sourceUrl}`);
+    const etag = res.headers.get("etag");
+    const lastModified = res.headers.get("last-modified");
+    const bytes = await res.arrayBuffer();
+    const sha256 = await sha256Hex(bytes);
+    const length = bytes.byteLength;
+    const fetchedAt = new Date().toISOString();
+    const known = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM source_versions WHERE source_id = ? AND sha256 = ?`,
+        sourceId, sha256,
+      )
+      .toArray();
+    this.ctx.storage.sql.exec(`UPDATE sources SET last_seen_at = ? WHERE id = ?`, fetchedAt, sourceId);
+    if (known.length > 0) return { sha256, skipped: true };
+    // Bytes intentionally discarded after hashing; parse happens in a later job.
+    this.ctx.storage.sql.exec(
+      `INSERT INTO source_versions (source_id, fetched_at, sha256, content_length, http_etag, http_last_modified, parse_status)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending_parse')`,
+      sourceId, fetchedAt, sha256, length, etag, lastModified,
+    );
+    return { sha256, skipped: false };
+  }
+
+  private failOrRetry(jobId: number, attempts: number, err: string) {
+    if (attempts >= MAX_ATTEMPTS) {
+      this.ctx.storage.sql.exec(
+        `UPDATE ingestion_jobs SET status = 'failed', completed_at = datetime('now'), last_error = ? WHERE id = ?`,
+        String(err).slice(0, 1000), jobId,
+      );
+    } else {
+      const next = new Date(Date.now() + backoffMs(attempts)).toISOString();
+      this.ctx.storage.sql.exec(
+        `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = ?, last_error = ? WHERE id = ?`,
+        next, String(err).slice(0, 1000), jobId,
+      );
+    }
   }
 
   async alarm(): Promise<void> {
+    const now = new Date().toISOString();
     const jobs = this.ctx.storage.sql
-      .exec<{ id: number; job_type: string }>(
-        `SELECT id, job_type FROM ingestion_jobs
-         WHERE status = 'pending'
-         ORDER BY id ASC LIMIT 5`,
+      .exec<{ id: number; job_type: string; source_id: number | null; source_url: string | null; attempts: number }>(
+        `SELECT id, job_type, source_id, source_url, attempts FROM ingestion_jobs
+         WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+         ORDER BY id ASC LIMIT ?`,
+        now, BATCH_SIZE,
       )
       .toArray();
     for (const job of jobs) {
@@ -109,19 +328,51 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
         `UPDATE ingestion_jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1 WHERE id = ?`,
         job.id,
       );
-      // Discovery/parse implemented in follow-up; mark placeholder complete without inventing records.
-      this.ctx.storage.sql.exec(
-        `UPDATE ingestion_jobs SET status = 'needs_implementation', completed_at = datetime('now'), last_error = 'parser/discovery not yet implemented' WHERE id = ?`,
-        job.id,
-      );
+      const attempts = job.attempts + 1;
+      try {
+        if (job.job_type === "discover_house") {
+          const r = await this.discoverHouse();
+          this.ctx.storage.sql.exec(
+            `UPDATE ingestion_jobs SET status = 'completed', completed_at = datetime('now'), last_error = NULL WHERE id = ?`,
+            job.id,
+          );
+          void r;
+        } else if (job.job_type === "fetch_source" && job.source_id && job.source_url) {
+          const r = await this.fetchSource(job.source_id, job.source_url);
+          this.ctx.storage.sql.exec(
+            `UPDATE ingestion_jobs SET status = 'completed', completed_at = datetime('now'), last_error = ? WHERE id = ?`,
+            r.skipped ? "skipped_duplicate_version" : null, job.id,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            `UPDATE ingestion_jobs SET status = 'failed', completed_at = datetime('now'), last_error = ? WHERE id = ?`,
+            `unknown job_type ${job.job_type}`, job.id,
+          );
+        }
+      } catch (err) {
+        this.failOrRetry(job.id, attempts, err instanceof Error ? err.message : String(err));
+      }
     }
     const remaining = this.ctx.storage.sql
-      .exec<{ n: number }>(
-        `SELECT COUNT(*) as n FROM ingestion_jobs WHERE status = 'pending'`,
+      .exec<{ n: number; next_at: string | null }>(
+        `SELECT COUNT(*) as n, MIN(next_retry_at) as next_at FROM ingestion_jobs WHERE status = 'pending'`,
       )
-      .one().n;
-    if (remaining > 0) await this.ctx.storage.setAlarm(Date.now() + 15_000);
+      .one();
+    if (remaining.n > 0) {
+      const delay = remaining.next_at
+        ? Math.max(1000, Math.min(15 * 60 * 1000, new Date(remaining.next_at).getTime() - Date.now()))
+        : 15_000;
+      await this.ctx.storage.setAlarm(Date.now() + (Number.isFinite(delay) ? delay : 15_000));
+    }
   }
+}
+
+function hashStr(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return h;
 }
 
 function adminOk(request: Request, env: Env): boolean {
