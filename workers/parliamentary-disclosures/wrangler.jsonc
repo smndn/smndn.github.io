@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "simondean-parliamentary-disclosures",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": true },
+  "triggers": {
+    "crons": ["0 6 * * *"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PARLIAMENTARY_DISCLOSURES",
+        "class_name": "ParliamentaryDisclosures"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ParliamentaryDisclosures"]
+    }
+  ]
+}

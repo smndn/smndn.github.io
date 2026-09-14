@@ -1,3 +1,6 @@
 node_modules/
 .wrangler/
 .dev.vars
+
+workers/parliamentary-disclosures/node_modules/
+workers/parliamentary-disclosures/.wrangler/

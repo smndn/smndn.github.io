@@ -1,0 +1,14 @@
+{
+  "name": "simondean-parliamentary-disclosures",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "wrangler": "^4.131.2"
+  }
+}
