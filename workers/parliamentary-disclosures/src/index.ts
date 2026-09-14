@@ -195,6 +195,172 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     return rows.length;
   }
 
+  async latest(limit = 20) {
+    const lim = Math.min(100, Math.max(1, Number(limit) || 20));
+    const rows = this.ctx.storage.sql
+      .exec<{
+        id: number;
+        raw_text: string;
+        category: string | null;
+        event_type: string | null;
+        disclosure_date: string | null;
+        politician_id: number | null;
+        politician_name: string | null;
+        politician_slug: string | null;
+        created_at: string;
+      }>(
+        `SELECT d.id, d.raw_text, d.category, d.event_type, d.disclosure_date,
+                d.politician_id, p.full_name as politician_name, p.slug as politician_slug,
+                d.created_at
+         FROM disclosures d LEFT JOIN politicians p ON p.id = d.politician_id
+         ORDER BY d.created_at DESC, d.id DESC LIMIT ?`,
+        lim,
+      )
+      .toArray();
+    return { results: rows };
+  }
+
+  async aviation(limit = 50) {
+    const lim = Math.min(100, Math.max(1, Number(limit) || 50));
+    const rows = this.ctx.storage.sql
+      .exec<{
+        id: number;
+        raw_text: string;
+        category: string | null;
+        event_type: string | null;
+        disclosure_date: string | null;
+        politician_id: number | null;
+        politician_name: string | null;
+        politician_slug: string | null;
+      }>(
+        `SELECT DISTINCT d.id, d.raw_text, d.category, d.event_type, d.disclosure_date,
+                d.politician_id, p.full_name as politician_name, p.slug as politician_slug
+         FROM disclosures d
+         LEFT JOIN politicians p ON p.id = d.politician_id
+         LEFT JOIN aviation_details ad ON ad.disclosure_id = d.id
+         LEFT JOIN disclosure_tags dt ON dt.disclosure_id = d.id
+         LEFT JOIN tags t ON t.id = dt.tag_id
+         WHERE d.category = 'aviation' OR ad.disclosure_id IS NOT NULL
+            OR t.slug LIKE 'aviat%' OR t.name LIKE '%aviat%'
+            OR d.raw_text LIKE '%Qantas%' OR d.raw_text LIKE '%Virgin%'
+            OR d.raw_text LIKE '%Chairman%Lounge%' OR d.raw_text LIKE '%upgrade%'
+         ORDER BY d.disclosure_date DESC NULLS LAST, d.id DESC LIMIT ?`,
+        lim,
+      )
+      .toArray();
+    return { results: rows };
+  }
+
+  async getPolitician(slug: string) {
+    const pols = this.ctx.storage.sql
+      .exec<{
+        id: number; slug: string; full_name: string; chamber: string;
+        electorate: string | null; state: string | null; party: string | null;
+      }>(
+        `SELECT id, slug, full_name, chamber, electorate, state, party
+         FROM politicians WHERE slug = ? LIMIT 1`,
+        slug,
+      )
+      .toArray();
+    if (pols.length === 0) return null;
+    const pol = pols[0];
+    const disclosures = this.ctx.storage.sql
+      .exec<{
+        id: number; raw_text: string; category: string | null; event_type: string | null;
+        disclosure_date: string | null; lodged_date: string | null; source_page: number | null;
+      }>(
+        `SELECT id, raw_text, category, event_type, disclosure_date, lodged_date, source_page
+         FROM disclosures WHERE politician_id = ?
+         ORDER BY disclosure_date DESC NULLS LAST, id DESC LIMIT 200`,
+        pol.id,
+      )
+      .toArray();
+    const sources = this.ctx.storage.sql
+      .exec<{ source_url: string; source_title: string | null; parliament: number | null; chamber: string; last_seen_at: string }>(
+        `SELECT s.source_url, s.source_title, s.parliament, s.chamber, s.last_seen_at
+         FROM sources s WHERE s.politician_id = ? ORDER BY s.parliament DESC NULLS LAST LIMIT 20`,
+        pol.id,
+      )
+      .toArray();
+    return { politician: pol, disclosures, sources };
+  }
+
+  async getEntity(slug: string) {
+    const ents = this.ctx.storage.sql
+      .exec<{ id: number; canonical_name: string; entity_type: string | null; slug: string }>(
+        `SELECT id, canonical_name, entity_type, slug FROM entities WHERE slug = ? LIMIT 1`,
+        slug,
+      )
+      .toArray();
+    if (ents.length === 0) return null;
+    const ent = ents[0];
+    const disclosures = this.ctx.storage.sql
+      .exec<{
+        id: number; raw_text: string; category: string | null; event_type: string | null;
+        disclosure_date: string | null; politician_name: string | null; politician_slug: string | null; role: string | null;
+      }>(
+        `SELECT d.id, d.raw_text, d.category, d.event_type, d.disclosure_date,
+                p.full_name as politician_name, p.slug as politician_slug, de.role
+         FROM disclosure_entities de
+         JOIN disclosures d ON d.id = de.disclosure_id
+         LEFT JOIN politicians p ON p.id = d.politician_id
+         WHERE de.entity_id = ? ORDER BY d.disclosure_date DESC NULLS LAST, d.id DESC LIMIT 200`,
+        ent.id,
+      )
+      .toArray();
+    const politicians = this.ctx.storage.sql
+      .exec<{ politician_name: string | null; politician_slug: string | null; n: number }>(
+        `SELECT p.full_name as politician_name, p.slug as politician_slug, COUNT(*) as n
+         FROM disclosure_entities de
+         JOIN disclosures d ON d.id = de.disclosure_id
+         LEFT JOIN politicians p ON p.id = d.politician_id
+         WHERE de.entity_id = ? GROUP BY p.id ORDER BY n DESC LIMIT 50`,
+        ent.id,
+      )
+      .toArray();
+    return { entity: ent, disclosures, politicians, total: disclosures.length };
+  }
+
+  async homeStats() {
+    const q = (sql: string, ...params: unknown[]): number =>
+      this.ctx.storage.sql.exec<{ n: number }>(sql, ...(params as never[])).one().n;
+    return {
+      disclosures: q("SELECT COUNT(*) as n FROM disclosures"),
+      politicians: q("SELECT COUNT(*) as n FROM politicians"),
+      entities: q("SELECT COUNT(*) as n FROM entities"),
+      sources: q("SELECT COUNT(*) as n FROM sources"),
+    };
+  }
+
+  async adminOverview() {
+    const recentJobs = this.ctx.storage.sql
+      .exec<{ id: number; job_type: string; status: string; attempts: number; last_error: string | null; created_at: string }>(
+        `SELECT id, job_type, status, attempts, last_error, created_at
+         FROM ingestion_jobs ORDER BY id DESC LIMIT 30`,
+      )
+      .toArray();
+    const failedJobs = this.ctx.storage.sql
+      .exec<{ id: number; job_type: string; source_url: string | null; attempts: number; last_error: string | null }>(
+        `SELECT id, job_type, source_url, attempts, last_error
+         FROM ingestion_jobs WHERE status = 'failed' ORDER BY id DESC LIMIT 30`,
+      )
+      .toArray();
+    const lowConfidence = this.ctx.storage.sql
+      .exec<{ id: number; raw_text: string; parser_confidence: number | null; politician_id: number | null }>(
+        `SELECT id, substr(raw_text,1,200) as raw_text, parser_confidence, politician_id
+         FROM disclosures WHERE parser_confidence IS NOT NULL AND parser_confidence < 0.7
+         ORDER BY id DESC LIMIT 30`,
+      )
+      .toArray();
+    const needsReview = this.ctx.storage.sql
+      .exec<{ disclosure_id: number; editorial_note: string | null }>(
+        `SELECT disclosure_id, editorial_note FROM editorial WHERE needs_review = 1 LIMIT 30`,
+      )
+      .toArray();
+    const status = await this.status();
+    return { status, recentJobs, failedJobs, lowConfidence, needsReview };
+  }
+
   async enqueueDiscovery(): Promise<{ queued: boolean; job_id?: number }> {
     const existing = this.ctx.storage.sql
       .exec<{ id: number }>(
@@ -525,12 +691,73 @@ function hashStr(s: string): number {
   return h;
 }
 
-function adminOk(request: Request, env: Env): boolean {
+function adminOk(request: Request, env: Env, url?: URL): boolean {
   const secret = env.ADMIN_SECRET;
   if (!secret) return false;
   const header = request.headers.get("authorization") || "";
-  return header === `Bearer ${secret}`;
+  if (header === `Bearer ${secret}`) return true;
+  if (url && url.searchParams.get("key") === secret) return true;
+  return false;
 }
+
+function esc(s: string | null | undefined): string {
+  return (s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+const BASE_CSS =
+  "body{font-family:-apple-system,system-ui,Georgia,serif;max-width:44rem;margin:0 auto;padding:2rem 1rem;color:#1a1a1a;background:#fafaf8;line-height:1.55}" +
+  "a{color:#1a3a6b}header nav a{margin-right:1rem;font-size:.9rem}" +
+  ".disc{border-top:1px solid #ddd;padding:.9rem 0}blockquote{margin:.4rem 0;padding:.2rem .8rem;border-left:3px solid #999;color:#222}" +
+  ".meta{font-size:.82rem;color:#555}.tag{display:inline-block;font-size:.75rem;background:#eee;border-radius:3px;padding:0 .4rem;margin-right:.3rem}" +
+  "form.search{margin:1.2rem 0}input[type=search]{width:70%;padding:.5rem;font-size:1rem}button{padding:.5rem .9rem}" +
+  "footer{margin-top:3rem;font-size:.8rem;color:#666;border-top:1px solid #ddd;padding-top:1rem}";
+
+function layout(title: string, body: string, desc?: string): Response {
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${esc(title)} · Parliamentary disclosures</title>` +
+    (desc ? `<meta name="description" content="${esc(desc)}">` : "") +
+    `<style>${BASE_CSS}</style></head><body>` +
+    `<header><nav><a href="/parliamentary-disclosures">Home</a><a href="/parliamentary-disclosures/aviation">Aviation</a><a href="/parliamentary-disclosures/methodology">Methodology</a></nav></header>` +
+    body +
+    `<footer><p>A searchable index of Australian federal parliamentary disclosures. Parliament of Australia remains the authoritative source. Classifications are derived and may contain errors — always check the original source.</p></footer>` +
+    `</body></html>`;
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" } });
+}
+
+interface DiscRow {
+  id: number;
+  raw_text: string;
+  category?: string | null;
+  event_type?: string | null;
+  disclosure_date?: string | null;
+  politician_name?: string | null;
+  politician_slug?: string | null;
+}
+
+function discCard(d: DiscRow): string {
+  const who = d.politician_slug
+    ? `<a href="/parliamentary-disclosures/${esc(d.politician_slug)}">${esc(d.politician_name || d.politician_slug)}</a>`
+    : esc(d.politician_name || "");
+  return `<div class="disc"><div class="meta">${who}${d.disclosure_date ? ` · declared ${esc(d.disclosure_date)}` : ""}` +
+    `${d.category ? ` · <span class="tag">${esc(d.category)}</span>` : ""}${d.event_type ? ` <span class="tag">${esc(d.event_type)}</span>` : ""}</div>` +
+    `<blockquote>${esc(d.raw_text)}</blockquote></div>`;
+}
+
+const METHODOLOGY_BODY = `<h1>Methodology</h1>
+<p>This site is a searchable index of Australian federal parliamentary disclosures. Parliament of Australia remains the authoritative source.</p>
+<ul>
+<li>Records are derived from official Parliament of Australia disclosure documents.</li>
+<li>Source files are fetched and parsed but not archived by this site.</li>
+<li>Exact disclosure wording is retained in structured records.</li>
+<li>AI is used to structure and classify records; classifications are separate from official source wording.</li>
+<li>Errors are possible — consult the original Parliamentary source via the “View original source” link.</li>
+<li>Additions and deletions are preserved as events; derived current-state views may contain interpretation.</li>
+<li>Blank, NIL, Not Applicable and unknown are treated differently.</li>
+</ul>`;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -548,24 +775,130 @@ export default {
     }
     if (path === "/api/parliamentary-disclosures/search" || path === "/api/search") {
       const q = url.searchParams.get("q") || "";
-      return json(await stub.search(q));
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 25));
+      return json(await stub.search(q, limit));
+    }
+    if (path === "/api/parliamentary-disclosures/latest" || path === "/api/latest") {
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 20));
+      return json(await stub.latest(limit));
+    }
+    if (path === "/api/parliamentary-disclosures/aviation" || path === "/api/aviation") {
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+      return json(await stub.aviation(limit));
+    }
+    {
+      const m = path.match(/^\/api\/(?:parliamentary-disclosures\/)?politicians\/([a-z0-9-]+)\/?$/);
+      if (m) {
+        const data = await stub.getPolitician(m[1]);
+        if (!data) return json({ error: "not_found" }, 404);
+        return json(data);
+      }
+    }
+    {
+      const m = path.match(/^\/api\/(?:parliamentary-disclosures\/)?entities\/([a-z0-9-]+)\/?$/);
+      if (m) {
+        const data = await stub.getEntity(m[1]);
+        if (!data) return json({ error: "not_found" }, 404);
+        return json(data);
+      }
     }
     if (path.startsWith("/api/admin/")) {
-      if (!adminOk(request, env)) return json({ error: "unauthorized" }, 401);
+      if (!adminOk(request, env, url)) return json({ error: "unauthorized" }, 401);
       if (path.endsWith("/discover") && request.method === "POST") {
         return json(await stub.enqueueDiscovery());
       }
+      if (path.endsWith("/overview")) {
+        return json(await stub.adminOverview());
+      }
       return json({ error: "not_found" }, 404);
     }
+    // ---- Public HTML ----
+    if (path === "/methodology" || path === "/methodology/") {
+      return layout("Methodology", METHODOLOGY_BODY,
+        "How this searchable index of Australian federal parliamentary disclosures is built.");
+    }
+    if (path === "/aviation" || path === "/aviation/") {
+      const { results } = await stub.aviation(50);
+      const cards = results.length > 0
+        ? results.map(discCard).join("")
+        : "<p>No aviation disclosures recorded yet. Parliament of Australia remains the authoritative source.</p>";
+      return layout("Aviation", `<h1>Aviation disclosures</h1>` +
+        `<p>Flight upgrades, lounge memberships, airline status and sponsored travel as listed in official disclosures. Wording below is the exact disclosure text.</p>${cards}`,
+        "Aviation-related disclosures listed by Australian federal parliamentarians.");
+    }
+    if (path === "/search" || url.searchParams.has("q")) {
+      const q = (url.searchParams.get("q") || "").trim();
+      if (!q) {
+        return layout("Search", `<h1>Search disclosures</h1>` +
+          `<form class="search" action="/parliamentary-disclosures/search" method="get"><input type="search" name="q" placeholder="Qantas, upgrade, lounge…" aria-label="Search disclosures"><button type="submit">Search</button></form>`);
+      }
+      const { results } = await stub.search(q, 50);
+      const cards = results.length > 0 ? results.map(discCard).join("") : `<p>No results recorded for “${esc(q)}”.</p>`;
+      return layout(`Search: ${q}`, `<h1>Disclosures matching “${esc(q)}”</h1>` +
+        `<form class="search" action="/parliamentary-disclosures/search" method="get"><input type="search" name="q" value="${esc(q)}" aria-label="Search disclosures"><button type="submit">Search</button></form>${cards}`);
+    }
+    {
+      const m = path.match(/^\/entities\/([a-z0-9-]+)\/?$/);
+      if (m) {
+        const data = await stub.getEntity(m[1]);
+        if (!data) return layout("Not found", `<h1>Not found</h1><p>No entity recorded under “${esc(m[1])}”.</p>`);
+        const cards = data.disclosures.length > 0
+          ? data.disclosures.map(discCard).join("")
+          : "<p>No disclosures recorded for this entity yet.</p>";
+        const people = data.politicians.map((p: { politician_name: string | null; politician_slug: string | null; n: number }) =>
+          p.politician_slug ? `<li><a href="/parliamentary-disclosures/${esc(p.politician_slug)}">${esc(p.politician_name || p.politician_slug)}</a> (${p.n})</li>` : "").join("");
+        return layout(data.entity.canonical_name, `<h1>${esc(data.entity.canonical_name)}</h1>` +
+          `<p class="meta">${esc(data.entity.entity_type || "entity")} · disclosed in ${data.total} record${data.total === 1 ? "" : "s"}</p>` +
+          (people ? `<h2>Politicians involved</h2><ul>${people}</ul>` : "") +
+          `<h2>Disclosures</h2>${cards}`);
+      }
+    }
+    if (path === "/admin" || path === "/admin/") {
+      if (!env.ADMIN_SECRET) return layout("Not found", `<h1>Not found</h1>`, undefined);
+      if (!adminOk(request, env, url)) return new Response("unauthorized", { status: 401 });
+      const ov = await stub.adminOverview();
+      const s = ov.status as { disclosures: number; sources: number; pending_jobs: number; muse_configured: boolean };
+      const jobRows = (ov.recentJobs as { id: number; job_type: string; status: string; attempts: number; last_error: string | null }[])
+        .map((j) => `<li>#${j.id} ${esc(j.job_type)} · ${esc(j.status)} · attempts ${j.attempts}${j.last_error ? ` · ${esc(j.last_error)}` : ""}</li>`).join("");
+      const lowRows = (ov.lowConfidence as { id: number; raw_text: string; parser_confidence: number | null }[])
+        .map((d) => `<li>#${d.id} (${d.parser_confidence}) ${esc(d.raw_text)}</li>`).join("");
+      return layout("Admin", `<h1>Admin</h1>` +
+        `<p class="meta">${s.disclosures} disclosures · ${s.sources} sources · ${s.pending_jobs} pending jobs · parser ${s.muse_configured ? "configured" : "not configured"}</p>` +
+        `<form action="/parliamentary-disclosures/api/admin/discover?key=${esc(url.searchParams.get("key") || "")}" method="post"><button type="submit">Queue House discovery</button></form>` +
+        `<h2>Recent jobs</h2><ul>${jobRows || "<li>None</li>"}</ul>` +
+        `<h2>Failed jobs</h2><ul>${(ov.failedJobs as { id: number; job_type: string; last_error: string | null }[]).map((j) => `<li>#${j.id} ${esc(j.job_type)} · ${esc(j.last_error || "")}</li>`).join("") || "<li>None</li>"}</ul>` +
+        `<h2>Low confidence</h2><ul>${lowRows || "<li>None</li>"}</ul>`);
+    }
+    {
+      // Politician page: /:slug (single path segment). Must come after specific routes.
+      const m = path.match(/^\/([a-z0-9-]{2,80})\/?$/);
+      if (m && !["api", "admin", "search", "aviation", "methodology", "entities", "favicon.ico"].includes(m[1])) {
+        const data = await stub.getPolitician(m[1]);
+        if (!data) return layout("Not found", `<h1>Not found</h1><p>No disclosures recorded for “${esc(m[1])}”.</p>`);
+        const p = data.politician as { full_name: string; chamber: string; electorate: string | null; state: string | null; party: string | null };
+        const cards = (data.disclosures as DiscRow[]).length > 0
+          ? (data.disclosures as DiscRow[]).map((d) => discCard({ ...d, politician_name: p.full_name, politician_slug: m[1] })).join("")
+          : "<p>No disclosures recorded yet.</p>";
+        const srcLinks = (data.sources as { source_url: string; source_title: string | null; last_seen_at: string }[])
+          .map((s) => `<li><a href="${esc(s.source_url)}">View original source</a>${s.source_title ? ` — ${esc(s.source_title)}` : ""} <span class="meta">(accessed ${esc(s.last_seen_at)})</span></li>`).join("");
+        return layout(p.full_name, `<h1>${esc(p.full_name)}</h1>` +
+          `<p class="meta">${esc(p.chamber)}${p.electorate ? ` · ${esc(p.electorate)}` : ""}${p.state ? ` · ${esc(p.state)}` : ""}${p.party ? ` · ${esc(p.party)}` : ""}</p>` +
+          `<h2>Disclosures</h2>${cards}` +
+          (srcLinks ? `<h2>Sources</h2><ul>${srcLinks}</ul><p class="meta">Parliament of Australia remains the authoritative source.</p>` : ""));
+      }
+    }
     if (path === "/" || path === "") {
-      return new Response(
-        `<!doctype html><meta charset="utf-8"><title>Parliamentary disclosures</title>
-<style>body{font-family:system-ui;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#111;background:#fafafa}a{color:#111}</style>
-<h1>Parliamentary disclosures</h1>
-<p>Searchable index of Australian federal parliamentary disclosures. Parliament of Australia remains the authoritative source.</p>
-<p><a href="/parliamentary-disclosures/methodology">Methodology</a></p>`,
-        { headers: { "content-type": "text/html; charset=utf-8" } },
-      );
+      const [stats, latest] = await Promise.all([stub.homeStats(), stub.latest(10)]);
+      const s = stats as { disclosures: number; politicians: number; entities: number; sources: number };
+      const cards = (latest.results as DiscRow[]).map(discCard).join("");
+      return layout("Parliamentary disclosures",
+        `<h1>Parliamentary disclosures</h1>` +
+        `<p>A searchable index of Australian federal parliamentary disclosures. Parliament of Australia remains the authoritative source.</p>` +
+        `<form class="search" action="/parliamentary-disclosures/search" method="get"><input type="search" name="q" placeholder="Qantas, upgrade, lounge…" aria-label="Search disclosures"><button type="submit">Search</button></form>` +
+        `<p class="meta">${s.disclosures} disclosures · ${s.politicians} politicians · ${s.entities} entities · ${s.sources} sources</p>` +
+        `<p><a href="/parliamentary-disclosures/aviation">Aviation disclosures</a> · <a href="/parliamentary-disclosures/methodology">Methodology</a></p>` +
+        `<h2>Latest disclosures</h2>${cards || "<p>No disclosures recorded yet.</p>"}`,
+        "A searchable index of Australian federal parliamentary disclosures.");
     }
     return json({ error: "not_found" }, 404);
   },
