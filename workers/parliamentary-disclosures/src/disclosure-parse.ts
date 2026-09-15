@@ -184,7 +184,16 @@ function validateDisclosure(
     item["event_type"] = "unknown";
     eventType = "unknown";
   }
-  const rawText = item["raw_text"];
+  let rawText = item["raw_text"];
+  if (typeof rawText !== "string" || rawText.trim().length === 0) {
+    for (const k of ["text", "wording", "source_text", "exact_text", "content"]) {
+      if (typeof item[k] === "string" && String(item[k]).trim()) {
+        rawText = item[k];
+        item["raw_text"] = rawText;
+        break;
+      }
+    }
+  }
   if (typeof rawText !== "string" || rawText.trim().length === 0) {
     errors.push(`${tag}.raw_text: required non-empty string`);
     return null;
