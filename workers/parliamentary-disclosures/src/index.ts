@@ -9,13 +9,20 @@ export interface Env {
   ADMIN_SECRET?: string;
 }
 
-const HOUSE_INDEX_URL = "https://www.aph.gov.au/register";
+const HOUSE_INDEX_URL =
+  "https://www.aph.gov.au/Senators_and_Members/Members/Register";
 const APH_ORIGIN = "https://www.aph.gov.au";
+const ALLOWED_SOURCE_HOSTS = new Set([
+  "www.aph.gov.au",
+  "aph.gov.au",
+  "static.aph.gov.au",
+  "interests-register-api-public.aph.gov.au",
+]);
 const CURRENT_PARLIAMENT = 48;
 const MAX_ATTEMPTS = 5;
-const BATCH_SIZE = 5;
+const BATCH_SIZE = 3;
 const FETCH_UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 simondean.xyz-parliamentary-disclosures/1.0";
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 function json(data: unknown, status = 200, extra: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -54,36 +61,44 @@ interface DiscoveredLink {
   title: string;
 }
 
-/** Extract official APH document links from register index HTML. */
+function isMemberStatementUrl(url: string): boolean {
+  const u = url.toLowerCase();
+  if (u.includes("explanatory") || u.includes("resolutions") || u.includes("9oct1984")) return false;
+  return (
+    u.includes("interests-register-api-public.aph.gov.au/api/members/") ||
+    (u.includes("static.aph.gov.au") && u.includes("/register/") && u.includes(".pdf"))
+  );
+}
+
+/** House register table: unquoted href= plus static.aph / public statement API. */
 export function extractHouseLinks(html: string, base = APH_ORIGIN): DiscoveredLink[] {
   const out: DiscoveredLink[] = [];
   const seen = new Set<string>();
-  const re = /<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)<\/a\s*>/gi;
+  const rowRe =
+    /<td>\s*([^<]+?)\s*<\/td>\s*<td class="format">\s*<a\s+href=([^\s>]+)/gi;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    let href = (m[1] || "").trim();
-    if (!href || href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("javascript:")) continue;
+  while ((m = rowRe.exec(html)) !== null) {
+    const title = cleanText(m[1] || "").slice(0, 200);
+    let href = (m[2] || "").trim().replace(/^['"]|['"]$/g, "");
+    if (!href) continue;
     let absolute: string;
     try {
       absolute = new URL(href, base).toString();
     } catch {
       continue;
     }
-    if (!absolute.startsWith(APH_ORIGIN)) continue;
-    const lower = absolute.toLowerCase();
-    const looksOfficial =
-      lower.endsWith(".pdf") ||
-      lower.includes("register") ||
-      lower.includes("interest") ||
-      lower.includes("statement") ||
-      lower.includes("declaration") ||
-      lower.includes("members-interest") ||
-      lower.includes("members_interests");
-    if (!looksOfficial) continue;
-    if (seen.has(absolute)) continue;
-    seen.add(absolute);
-    const title = cleanText(m[2] || "").slice(0, 200);
-    out.push({ url: absolute, title });
+    let host: string;
+    try {
+      host = new URL(absolute).host;
+    } catch {
+      continue;
+    }
+    if (!ALLOWED_SOURCE_HOSTS.has(host)) continue;
+    if (!isMemberStatementUrl(absolute)) continue;
+    const key = absolute.split("?")[0];
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ url: absolute, title: title || key });
   }
   return out;
 }
@@ -468,6 +483,8 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     const etag = res.headers.get("etag");
     const lastModified = res.headers.get("last-modified");
     const bytes = await res.arrayBuffer();
+    const head = new Uint8Array(bytes.slice(0, 5));
+    const isPdf = String.fromCharCode(...head) === "%PDF-";
     const sha256 = await sha256Hex(bytes);
     const length = bytes.byteLength;
     const fetchedAt = new Date().toISOString();
@@ -479,18 +496,19 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       .toArray();
     this.ctx.storage.sql.exec(`UPDATE sources SET last_seen_at = ? WHERE id = ?`, fetchedAt, sourceId);
     if (known.length > 0) return { sha256, skipped: true };
-    // Bytes intentionally discarded after hashing; parse happens in a later job.
     this.ctx.storage.sql.exec(
       `INSERT INTO source_versions (source_id, fetched_at, sha256, content_length, http_etag, http_last_modified, parse_status)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending_parse')`,
-      sourceId, fetchedAt, sha256, length, etag, lastModified,
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      sourceId, fetchedAt, sha256, length, etag, lastModified, isPdf ? "pending_parse" : "skipped_not_pdf",
     );
     const versionId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
-    this.ctx.storage.sql.exec(
-      `INSERT INTO ingestion_jobs (job_type, source_id, source_url, status) VALUES ('parse_version', ?, ?, 'pending')`,
-      sourceId, `${sourceUrl}#v=${versionId}`,
-    );
-    return { sha256, skipped: false };
+    if (isPdf) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO ingestion_jobs (job_type, source_id, source_url, status) VALUES ('parse_version', ?, ?, 'pending')`,
+        sourceId, `${sourceUrl}#v=${versionId}`,
+      );
+    }
+    return { sha256, skipped: !isPdf };
   }
 
   async parseVersion(sourceId: number, sourceUrl: string): Promise<{ status: string; count: number }> {
@@ -542,21 +560,28 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       }
     };
     let museOut;
-    let extractionMethod: "direct_pdf_model" | "embedded_pdf_text" = "direct_pdf_model";
-    try {
-      museOut = await callMuseWithRetry(
-        key,
-        { pdfBytes: bytes, pdfFilename: "source.pdf", extractionMethod: "direct_pdf_model" },
-        meta,
-        isJsonish,
-      );
-    } catch (err) {
-      const text = extractEmbeddedPdfText(bytes);
-      if (text.length < 80) throw err;
-      extractionMethod = "embedded_pdf_text";
-      museOut = await callMuseWithRetry(key, { text, extractionMethod }, meta, isJsonish);
+    let extractionMethod: "direct_pdf_model" | "embedded_pdf_text" = "embedded_pdf_text";
+    const text = extractEmbeddedPdfText(bytes);
+    if (text.length < 80) {
+      throw new Error(`embedded PDF text too short (${text.length} chars)`);
     }
-    const validated = await validateParsedOutput(museOut.rawText);
+    museOut = await callMuseWithRetry(key, { text, extractionMethod }, meta, isJsonish);
+    let rawForValidate = museOut.rawText;
+    try {
+      const obj = JSON.parse(rawForValidate) as Record<string, unknown>;
+      const doc =
+        obj.document && typeof obj.document === "object"
+          ? { ...(obj.document as Record<string, unknown>) }
+          : {};
+      if (!doc.politician_name || String(doc.politician_name).trim() === "") {
+        doc.politician_name = pol.full_name;
+      }
+      obj.document = doc;
+      rawForValidate = JSON.stringify(obj);
+    } catch {
+      /* validateParsedOutput will reject */
+    }
+    const validated = await validateParsedOutput(rawForValidate);
     if (!validated.ok || !validated.document) {
       this.ctx.storage.sql.exec(
         `UPDATE parser_runs SET completed_at = datetime('now'), status = 'failed_validation', error_summary = ? WHERE id = ?`,
@@ -767,7 +792,7 @@ export default {
 
     if (path === "/api/health" || path === "/api/parliamentary-disclosures/health") {
       const st = await stub.status();
-      if (st.sources === 0 && st.pending_jobs === 0) {
+      if (st.sources < 50 && st.pending_jobs === 0) {
         await stub.enqueueDiscovery();
       }
       await stub.requeueUnknownParseJobs();
