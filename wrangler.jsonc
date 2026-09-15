@@ -2,5 +2,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "simondean-xyz",
   "compatibility_date": "2026-09-14",
-  "pages_build_output_dir": "public"
+  "pages_build_output_dir": "public",
+  "vars": {
+    "PARLIAMENTARY_WORKER_URL": "https://simondean-parliamentary-disclosures.notsimondean.workers.dev"
+  }
 }

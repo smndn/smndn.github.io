@@ -13,6 +13,8 @@ export interface Env {
 
 const HOUSE_INDEX_URL =
   "https://www.aph.gov.au/Senators_and_Members/Members/Register";
+const SENATE_VOLUMES_URL =
+  "https://www.aph.gov.au/Parliamentary_Business/Committees/Senate/Senators_Interests/Tabled_volumes";
 const APH_ORIGIN = "https://www.aph.gov.au";
 const ALLOWED_SOURCE_HOSTS = new Set([
   "www.aph.gov.au",
@@ -61,6 +63,7 @@ function cleanText(html: string): string {
 interface DiscoveredLink {
   url: string;
   title: string;
+  chamber: "house" | "senate";
 }
 
 function isMemberStatementUrl(url: string): boolean {
@@ -68,7 +71,8 @@ function isMemberStatementUrl(url: string): boolean {
   if (u.includes("explanatory") || u.includes("resolutions") || u.includes("9oct1984")) return false;
   return (
     u.includes("interests-register-api-public.aph.gov.au/api/members/") ||
-    (u.includes("static.aph.gov.au") && u.includes("/register/") && u.includes(".pdf"))
+    (u.includes("static.aph.gov.au") && u.includes("/register/") && u.includes(".pdf")) ||
+    (u.includes("aph.gov.au") && u.includes("/media/") && u.includes(".ashx"))
   );
 }
 
@@ -100,7 +104,44 @@ export function extractHouseLinks(html: string, base = APH_ORIGIN): DiscoveredLi
     const key = absolute.split("?")[0];
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ url: absolute, title: title || key });
+    out.push({ url: absolute, title: title || key, chamber: "house" });
+  }
+  return out;
+}
+
+function volumeTooLarge(title: string): boolean {
+  const m = title.match(/PDF\s+([\d.]+)\s*(MB|Kb|KB)/i);
+  if (!m) return false;
+  let n = Number(m[1]);
+  if (/kb/i.test(m[2]) && n > 20) n = n / 1024;
+  return n > 8;
+}
+
+export function extractSenateVolumeLinks(html: string, base = APH_ORIGIN): DiscoveredLink[] {
+  const out: DiscoveredLink[] = [];
+  const seen = new Set<string>();
+  const re = /<a[^>]+href=["']?([^"'>\s]*media\/[^"'>\s]+)["']?[^>]*>([\s\S]*?)<\/a>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const title = cleanText(m[2] || "").replace(/&nbsp;/g, " ");
+    if (!/20(2[5-9]|[3-9]\d)/.test(title) && !/2026/.test(title)) {
+      if (!/2025|2026/.test(title)) continue;
+    }
+    if (!/2025|2026/.test(title)) continue;
+    if (volumeTooLarge(title)) continue;
+    let href = (m[1] || "").trim().replace(/^~/, "");
+    if (href.startsWith("-/")) href = "/" + href.slice(1);
+    if (!href.startsWith("/")) href = "/" + href.replace(/^\//, "");
+    let absolute: string;
+    try {
+      absolute = new URL(href, base).toString();
+    } catch {
+      continue;
+    }
+    const key = absolute.split("?")[0].toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ url: absolute, title: title || key, chamber: "senate" });
   }
   return out;
 }
@@ -166,6 +207,7 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       singleton: "global",
       disclosures: q("SELECT COUNT(*) as n FROM disclosures"),
       sources: q("SELECT COUNT(*) as n FROM sources"),
+      senate_sources: q("SELECT COUNT(*) as n FROM sources WHERE chamber = 'senate'"),
       source_versions: q("SELECT COUNT(*) as n FROM source_versions"),
       pending_jobs: q("SELECT COUNT(*) as n FROM ingestion_jobs WHERE status = 'pending'"),
       jobs_by_status: jobsByStatus,
@@ -450,27 +492,30 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
 
   private upsertSource(link: DiscoveredLink): { sourceId: number; isNew: boolean } {
     const now = new Date().toISOString();
-    const name = link.title || link.url;
-    const slug = slugify(name) || `member-${Math.abs(hashStr(link.url))}`;
-    const existingPol = this.ctx.storage.sql
-      .exec<{ id: number }>(`SELECT id FROM politicians WHERE slug = ?`, slug)
-      .toArray();
-    let politicianId: number;
-    if (existingPol.length > 0) {
-      politicianId = existingPol[0].id;
-      this.ctx.storage.sql.exec(`UPDATE politicians SET last_seen_at = ?, active = 1 WHERE id = ?`, now, politicianId);
-    } else {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO politicians (slug, full_name, chamber, first_seen_at, last_seen_at, active)
-         VALUES (?, ?, 'house', ?, ?, 1)`,
-        slug, name.slice(0, 200), now, now,
-      );
-      politicianId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+    const chamber = link.chamber || "house";
+    let politicianId: number | null = null;
+    if (chamber === "house") {
+      const name = link.title || link.url;
+      const slug = slugify(name) || `member-${Math.abs(hashStr(link.url))}`;
+      const existingPol = this.ctx.storage.sql
+        .exec<{ id: number }>(`SELECT id FROM politicians WHERE slug = ?`, slug)
+        .toArray();
+      if (existingPol.length > 0) {
+        politicianId = existingPol[0].id;
+        this.ctx.storage.sql.exec(`UPDATE politicians SET last_seen_at = ?, active = 1 WHERE id = ?`, now, politicianId);
+      } else {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO politicians (slug, full_name, chamber, first_seen_at, last_seen_at, active)
+           VALUES (?, ?, 'house', ?, ?, 1)`,
+          slug, name.slice(0, 200), now, now,
+        );
+        politicianId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+      }
     }
     const existingSrc = this.ctx.storage.sql
       .exec<{ id: number }>(
-        `SELECT id FROM sources WHERE source_url = ? AND parliament = ? AND chamber = 'house'`,
-        link.url, CURRENT_PARLIAMENT,
+        `SELECT id FROM sources WHERE source_url = ? AND parliament = ? AND chamber = ?`,
+        link.url, CURRENT_PARLIAMENT, chamber,
       )
       .toArray();
     if (existingSrc.length > 0) {
@@ -483,8 +528,8 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     }
     this.ctx.storage.sql.exec(
       `INSERT INTO sources (politician_id, parliament, chamber, source_url, source_title, first_seen_at, last_seen_at)
-       VALUES (?, ?, 'house', ?, ?, ?, ?)`,
-      politicianId, CURRENT_PARLIAMENT, link.url, link.title || null, now, now,
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      politicianId, CURRENT_PARLIAMENT, chamber, link.url, link.title || null, now, now,
     );
     const sourceId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
     return { sourceId, isNew: true };
@@ -523,11 +568,50 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     return { sources_seen: links.length, sources_new: sourcesNew, jobs_queued: jobsQueued };
   }
 
+  async enqueueSenateDiscovery(): Promise<{ queued: boolean; job_id?: number }> {
+    const existing = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM ingestion_jobs WHERE job_type = 'discover_senate' AND status IN ('pending','running') ORDER BY id DESC LIMIT 1`,
+      )
+      .toArray();
+    if (existing.length > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1000);
+      return { queued: false, job_id: existing[0].id };
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO ingestion_jobs (job_type, source_url, status) VALUES ('discover_senate', ?, 'pending')`,
+      SENATE_VOLUMES_URL,
+    );
+    const id = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+    await this.ctx.storage.setAlarm(Date.now() + 1000);
+    return { queued: true, job_id: id };
+  }
+
+  async discoverSenate(): Promise<{ sources_seen: number; sources_new: number; jobs_queued: number }> {
+    const res = await fetch(SENATE_VOLUMES_URL, {
+      headers: { "user-agent": FETCH_UA, accept: "text/html,application/xhtml+xml" },
+    });
+    if (!res.ok) throw new Error(`senate volumes HTTP ${res.status}`);
+    const html = await res.text();
+    const links = extractSenateVolumeLinks(html, APH_ORIGIN);
+    if (links.length === 0) throw new Error("senate volumes parsed 0 official links");
+    let sourcesNew = 0;
+    let jobsQueued = 0;
+    for (const link of links) {
+      const { sourceId, isNew } = this.upsertSource(link);
+      if (isNew) sourcesNew++;
+      if (this.enqueueFetch(sourceId, link.url)) jobsQueued++;
+    }
+    return { sources_seen: links.length, sources_new: sourcesNew, jobs_queued: jobsQueued };
+  }
+
   async fetchSource(sourceId: number, sourceUrl: string): Promise<{ sha256: string; skipped: boolean }> {
     const res = await fetch(sourceUrl, {
       headers: { "user-agent": FETCH_UA, accept: "application/pdf,*/*" },
     });
     if (!res.ok) throw new Error(`source fetch HTTP ${res.status} for ${sourceUrl}`);
+    const lenHdr = Number(res.headers.get("content-length") || "0");
+    if (lenHdr > 9_000_000) throw new Error(`source too large (${lenHdr} bytes)`);
     const etag = res.headers.get("etag");
     const lastModified = res.headers.get("last-modified");
     const bytes = await res.arrayBuffer();
@@ -744,6 +828,13 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
             job.id,
           );
           void r;
+        } else if (job.job_type === "discover_senate") {
+          const r = await this.discoverSenate();
+          this.ctx.storage.sql.exec(
+            `UPDATE ingestion_jobs SET status = 'completed', completed_at = datetime('now'), last_error = NULL WHERE id = ?`,
+            job.id,
+          );
+          void r;
         } else if (job.job_type === "fetch_source" && job.source_id && job.source_url) {
           const r = await this.fetchSource(job.source_id, job.source_url);
           this.ctx.storage.sql.exec(
@@ -836,7 +927,7 @@ function layout(title: string, body: string, desc?: string): Response {
     `<title>${esc(title)} · Parliamentary disclosures</title>` +
     (desc ? `<meta name="description" content="${esc(desc)}">` : "") +
     `<style>${BASE_CSS}</style></head><body>` +
-    `<header><nav><a href="/parliamentary-disclosures">Home</a><a href="/parliamentary-disclosures/aviation">Aviation</a><a href="/parliamentary-disclosures/methodology">Methodology</a></nav></header>` +
+    `<header><nav><a href="/disclosures">Declared</a><a href="/disclosures/aviation">Aviation</a><a href="/disclosures/methodology">Methodology</a></nav></header>` +
     body +
     `<footer><p>A searchable index of Australian federal parliamentary disclosures. Parliament of Australia remains the authoritative source. Classifications are derived and may contain errors — always check the original source.</p></footer>` +
     `</body></html>`;
@@ -855,7 +946,7 @@ interface DiscRow {
 
 function discCard(d: DiscRow): string {
   const who = d.politician_slug
-    ? `<a href="/parliamentary-disclosures/${esc(d.politician_slug)}">${esc(d.politician_name || d.politician_slug)}</a>`
+    ? `<a href="/disclosures/${esc(d.politician_slug)}">${esc(d.politician_name || d.politician_slug)}</a>`
     : esc(d.politician_name || "");
   return `<div class="disc"><div class="meta">${who}${d.disclosure_date ? ` · declared ${esc(d.disclosure_date)}` : ""}` +
     `${d.category ? ` · <span class="tag">${esc(d.category)}</span>` : ""}${d.event_type ? ` <span class="tag">${esc(d.event_type)}</span>` : ""}</div>` +
@@ -877,7 +968,7 @@ const METHODOLOGY_BODY = `<h1>Methodology</h1>
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const path = url.pathname.replace(/^\/parliamentary-disclosures/, "") || "/";
+    const path = url.pathname.replace(/^\/(?:parliamentary-disclosures|disclosures)/, "") || "/";
     const stub = env.PARLIAMENTARY_DISCLOSURES.getByName("global");
 
     if (path === "/api/health" || path === "/api/parliamentary-disclosures/health") {
@@ -888,10 +979,13 @@ export default {
       if (st.disclosures === 0) {
         await stub.requeueEmptyParses();
       }
+      if ((st.senate_sources ?? 0) === 0) {
+        await stub.enqueueSenateDiscovery();
+      }
       await stub.kickAlarm();
       return json(await stub.status());
     }
-    if (path === "/api/parliamentary-disclosures/search" || path === "/api/search") {
+    if (path === "/api/parliamentary-disclosures/search" || path === "/api/disclosures/search" || path === "/api/search") {
       const q = url.searchParams.get("q") || "";
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 25));
       return json(await stub.search(q, limit));
@@ -948,12 +1042,12 @@ export default {
       const q = (url.searchParams.get("q") || "").trim();
       if (!q) {
         return layout("Search", `<h1>Search disclosures</h1>` +
-          `<form class="search" action="/parliamentary-disclosures/search" method="get"><input type="search" name="q" placeholder="Qantas, upgrade, lounge…" aria-label="Search disclosures"><button type="submit">Search</button></form>`);
+          `<form class="search" action="/disclosures/search" method="get"><input type="search" name="q" placeholder="Qantas, upgrade, lounge…" aria-label="Search disclosures"><button type="submit">Search</button></form>`);
       }
       const { results } = await stub.search(q, 50);
       const cards = results.length > 0 ? results.map(discCard).join("") : `<p>No results recorded for “${esc(q)}”.</p>`;
       return layout(`Search: ${q}`, `<h1>Disclosures matching “${esc(q)}”</h1>` +
-        `<form class="search" action="/parliamentary-disclosures/search" method="get"><input type="search" name="q" value="${esc(q)}" aria-label="Search disclosures"><button type="submit">Search</button></form>${cards}`);
+        `<form class="search" action="/disclosures/search" method="get"><input type="search" name="q" value="${esc(q)}" aria-label="Search disclosures"><button type="submit">Search</button></form>${cards}`);
     }
     {
       const m = path.match(/^\/entities\/([a-z0-9-]+)\/?$/);
@@ -964,7 +1058,7 @@ export default {
           ? data.disclosures.map(discCard).join("")
           : "<p>No disclosures recorded for this entity yet.</p>";
         const people = data.politicians.map((p: { politician_name: string | null; politician_slug: string | null; n: number }) =>
-          p.politician_slug ? `<li><a href="/parliamentary-disclosures/${esc(p.politician_slug)}">${esc(p.politician_name || p.politician_slug)}</a> (${p.n})</li>` : "").join("");
+          p.politician_slug ? `<li><a href="/disclosures/${esc(p.politician_slug)}">${esc(p.politician_name || p.politician_slug)}</a> (${p.n})</li>` : "").join("");
         return layout(data.entity.canonical_name, `<h1>${esc(data.entity.canonical_name)}</h1>` +
           `<p class="meta">${esc(data.entity.entity_type || "entity")} · disclosed in ${data.total} record${data.total === 1 ? "" : "s"}</p>` +
           (people ? `<h2>Politicians involved</h2><ul>${people}</ul>` : "") +
@@ -1009,12 +1103,12 @@ export default {
       const [stats, latest] = await Promise.all([stub.homeStats(), stub.latest(10)]);
       const s = stats as { disclosures: number; politicians: number; entities: number; sources: number };
       const cards = (latest.results as DiscRow[]).map(discCard).join("");
-      return layout("Parliamentary disclosures",
-        `<h1>Parliamentary disclosures</h1>` +
+      return layout("Declared",
+        `<h1>Declared</h1>` +
         `<p>A searchable index of Australian federal parliamentary disclosures. Parliament of Australia remains the authoritative source.</p>` +
-        `<form class="search" action="/parliamentary-disclosures/search" method="get"><input type="search" name="q" placeholder="Qantas, upgrade, lounge…" aria-label="Search disclosures"><button type="submit">Search</button></form>` +
+        `<form class="search" action="/disclosures/search" method="get"><input type="search" name="q" placeholder="Qantas, upgrade, lounge…" aria-label="Search disclosures"><button type="submit">Search</button></form>` +
         `<p class="meta">${s.disclosures} disclosures · ${s.politicians} politicians · ${s.entities} entities · ${s.sources} sources</p>` +
-        `<p><a href="/parliamentary-disclosures/aviation">Aviation disclosures</a> · <a href="/parliamentary-disclosures/methodology">Methodology</a></p>` +
+        `<p><a href="/disclosures/aviation">Aviation disclosures</a> · <a href="/disclosures/methodology">Methodology</a></p>` +
         `<h2>Latest disclosures</h2>${cards || "<p>No disclosures recorded yet.</p>"}`,
         "A searchable index of Australian federal parliamentary disclosures.");
     }
@@ -1024,5 +1118,6 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     const stub = env.PARLIAMENTARY_DISCLOSURES.getByName("global");
     await stub.enqueueDiscovery();
+    await stub.enqueueSenateDiscovery();
   },
 };
