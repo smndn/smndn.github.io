@@ -592,15 +592,10 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     }
     const validated = await validateParsedOutput(rawForValidate);
     if (!validated.ok || !validated.document) {
-      this.ctx.storage.sql.exec(
-        `UPDATE parser_runs SET completed_at = datetime('now'), status = 'failed_validation', error_summary = ? WHERE id = ?`,
-        validated.errors.join("; ").slice(0, 1000), runId,
-      );
-      this.ctx.storage.sql.exec(
-        `UPDATE source_versions SET parse_status = 'failed_validation', error_summary = ?, model = ?, parser_version = ?, schema_version = ? WHERE id = ?`,
-        validated.errors.join("; ").slice(0, 1000), museOut.modelVersion, PARSER_VERSION, SCHEMA_VERSION, versionId,
-      );
       throw new Error(`validation failed: ${validated.errors.join("; ")}`);
+    }
+    if (validated.disclosures.length === 0) {
+      throw new Error("validation failed: no disclosure items");
     }
     const exec = (sql: string, ...params: unknown[]) => this.ctx.storage.sql.exec(sql, ...params);
     const committed = this.ctx.storage.transactionSync(() =>

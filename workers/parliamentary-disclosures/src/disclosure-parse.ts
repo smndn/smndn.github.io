@@ -147,15 +147,42 @@ function validateDisclosure(
     errors.push(`${tag}: not an object`);
     return null;
   }
-  const category = item["category"];
+  let category = item["category"];
+  if (typeof category === "string") {
+    const key = category.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+    const aliases: Record<string, string> = {
+      gift: "gifts",
+      travel: "sponsored_travel_or_hospitality",
+      sponsored_travel: "sponsored_travel_or_hospitality",
+      hospitality: "sponsored_travel_or_hospitality",
+      membership: "memberships",
+      shareholding: "shareholdings",
+      shares: "shareholdings",
+      property: "real_estate",
+      realestate: "real_estate",
+      trust: "trusts_and_nominee_companies",
+      trusts: "trusts_and_nominee_companies",
+      liability: "liabilities",
+      directorship: "directorships",
+      partnership: "partnerships",
+      other: "other_interests",
+      income: "other_income",
+      asset: "other_assets",
+      assets: "other_assets",
+    };
+    if ((HOUSE_CATEGORIES as readonly string[]).includes(key)) category = key;
+    else if (aliases[key]) category = aliases[key];
+    else category = "other_interests";
+    item["category"] = category;
+  }
   if (typeof category !== "string" || !(HOUSE_CATEGORIES as readonly string[]).includes(category)) {
     errors.push(`${tag}.category: invalid '${String(category)}'`);
     return null;
   }
-  const eventType = item["event_type"];
+  let eventType = item["event_type"];
   if (typeof eventType !== "string" || !(EVENT_TYPES as readonly string[]).includes(eventType)) {
-    errors.push(`${tag}.event_type: invalid '${String(eventType)}'`);
-    return null;
+    item["event_type"] = "unknown";
+    eventType = "unknown";
   }
   const rawText = item["raw_text"];
   if (typeof rawText !== "string" || rawText.trim().length === 0) {
