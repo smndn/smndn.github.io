@@ -985,6 +985,10 @@ export default {
       if ((st.senate_sources ?? 0) === 0) {
         await stub.enqueueSenateDiscovery();
       }
+      const mediaFail = (st.recent_errors || []).some(
+        (e: { last_error?: string | null }) => (e.last_error || "").includes("https://media/"),
+      );
+      if (mediaFail) await stub.enqueueSenateDiscovery();
       await stub.kickAlarm();
       return json(await stub.status());
     }
