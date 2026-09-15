@@ -31,7 +31,7 @@ function json(data: unknown, status = 200, extra: HeadersInit = {}): Response {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      "cache-control": "public, max-age=30",
+      "cache-control": "no-store",
       ...extra,
     },
   });
