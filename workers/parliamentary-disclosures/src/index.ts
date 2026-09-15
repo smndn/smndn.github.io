@@ -4,6 +4,21 @@ import { SCHEMA_V1 } from "./schema";
 import { callMuseWithRetry, PARSER_VERSION, SCHEMA_VERSION } from "./muse";
 import { commitParsedVersion, validateParsedOutput } from "./disclosure-parse";
 import { extractHouseFormDisclosures, isHouseInterestsForm } from "./house-form";
+import {
+  extractAllSenateDisclosures,
+  isSenateInterestsForm,
+} from "./senate-form";
+import {
+  extractSenateVolumeLinks,
+  resolveSenatePdfUrl,
+  SENATE_VOLUMES_URL as SENATE_INDEX_URL,
+} from "./senate-discover";
+
+export {
+  extractSenateVolumeLinks,
+  senatePdfCandidateUrls,
+  volumeTooLarge,
+} from "./senate-discover";
 
 export interface Env {
   PARLIAMENTARY_DISCLOSURES: DurableObjectNamespace<ParliamentaryDisclosures>;
@@ -13,8 +28,7 @@ export interface Env {
 
 const HOUSE_INDEX_URL =
   "https://www.aph.gov.au/Senators_and_Members/Members/Register";
-const SENATE_VOLUMES_URL =
-  "https://www.aph.gov.au/Parliamentary_Business/Committees/Senate/Senators_Interests/Tabled_volumes";
+const SENATE_VOLUMES_URL = SENATE_INDEX_URL;
 const APH_ORIGIN = "https://www.aph.gov.au";
 const ALLOWED_SOURCE_HOSTS = new Set([
   "www.aph.gov.au",
@@ -109,45 +123,6 @@ export function extractHouseLinks(html: string, base = APH_ORIGIN): DiscoveredLi
   return out;
 }
 
-function volumeTooLarge(title: string): boolean {
-  const m = title.match(/PDF\s+([\d.]+)\s*(MB|Kb|KB)/i);
-  if (!m) return false;
-  let n = Number(m[1]);
-  if (/kb/i.test(m[2]) && n > 20) n = n / 1024;
-  return n > 8;
-}
-
-export function extractSenateVolumeLinks(html: string, base = APH_ORIGIN): DiscoveredLink[] {
-  const out: DiscoveredLink[] = [];
-  const seen = new Set<string>();
-  const re = /<a[^>]+href=["']?([^"'>\s]*media\/[^"'>\s]+)["']?[^>]*>([\s\S]*?)<\/a>/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    const title = cleanText(m[2] || "").replace(/&nbsp;/g, " ");
-    if (!/20(2[5-9]|[3-9]\d)/.test(title) && !/2026/.test(title)) {
-      if (!/2025|2026/.test(title)) continue;
-    }
-    if (!/2025|2026/.test(title)) continue;
-    if (volumeTooLarge(title)) continue;
-    let href = (m[1] || "").trim().replace(/^~/, "");
-    href = href.replace(/^-\//, "/");
-    if (href.toLowerCase().startsWith("/media/")) href = "/-" + href;
-    if (!href.startsWith("http")) {
-      if (!href.startsWith("/")) href = "/" + href;
-    }
-    let absolute: string;
-    try {
-      absolute = new URL(href, base).toString();
-    } catch {
-      continue;
-    }
-    const key = absolute.split("?")[0].toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ url: absolute, title: title || key, chamber: "senate" });
-  }
-  return out;
-}
 
 function backoffMs(attempts: number): number {
   return Math.min(15_000, 5_000 * Math.pow(2, Math.max(0, attempts - 1)));
@@ -211,6 +186,14 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       disclosures: q("SELECT COUNT(*) as n FROM disclosures"),
       sources: q("SELECT COUNT(*) as n FROM sources"),
       senate_sources: q("SELECT COUNT(*) as n FROM sources WHERE chamber = 'senate'"),
+      senate_versions: q(
+        `SELECT COUNT(*) as n FROM source_versions sv JOIN sources s ON s.id = sv.source_id WHERE s.chamber = 'senate'`,
+      ),
+      senate_ok_versions: q(
+        `SELECT COUNT(*) as n FROM source_versions sv JOIN sources s ON s.id = sv.source_id
+         WHERE s.chamber = 'senate' AND parse_status IN ('success','success_needs_review','pending_parse')`,
+      ),
+      senate_disclosures: q("SELECT COUNT(*) as n FROM disclosures WHERE chamber = 'senate'"),
       source_versions: q("SELECT COUNT(*) as n FROM source_versions"),
       pending_jobs: q("SELECT COUNT(*) as n FROM ingestion_jobs WHERE status = 'pending'"),
       jobs_by_status: jobsByStatus,
@@ -295,6 +278,32 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
          AND last_error LIKE 'validation failed: no disclosure%'`,
     );
     await this.ctx.storage.setAlarm(Date.now() + 400);
+    return 1;
+  }
+
+  /** Re-parse Senate volumes that were stored as PDFs but never split into senators. */
+  async requeueSenateParses(): Promise<number> {
+    this.ctx.storage.sql.exec(
+      `UPDATE source_versions SET parse_status = 'pending_parse'
+       WHERE id IN (
+         SELECT sv.id FROM source_versions sv
+         JOIN sources s ON s.id = sv.source_id
+         WHERE s.chamber = 'senate'
+           AND COALESCE(sv.disclosure_count, 0) = 0
+           AND sv.parse_status IN ('success','success_needs_review','pending_parse','skipped_not_pdf')
+       )`,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL, attempts = 0, last_error = NULL
+       WHERE job_type = 'parse_version'
+         AND source_id IN (
+           SELECT s.id FROM sources s
+           JOIN source_versions sv ON sv.source_id = s.id
+           WHERE s.chamber = 'senate' AND COALESCE(sv.disclosure_count, 0) = 0
+         )
+         AND status IN ('completed','failed')`,
+    );
+    await this.ctx.storage.setAlarm(Date.now() + 500);
     return 1;
   }
 
@@ -493,27 +502,33 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     return { queued: true, job_id: id };
   }
 
+  private ensurePolitician(name: string, chamber: "house" | "senate"): number {
+    const now = new Date().toISOString();
+    const slug = slugify(name) || `member-${Math.abs(hashStr(name))}`;
+    const existingPol = this.ctx.storage.sql
+      .exec<{ id: number }>(`SELECT id FROM politicians WHERE slug = ?`, slug)
+      .toArray();
+    if (existingPol.length > 0) {
+      this.ctx.storage.sql.exec(
+        `UPDATE politicians SET last_seen_at = ?, active = 1, chamber = COALESCE(chamber, ?) WHERE id = ?`,
+        now, chamber, existingPol[0].id,
+      );
+      return existingPol[0].id;
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO politicians (slug, full_name, chamber, first_seen_at, last_seen_at, active)
+       VALUES (?, ?, ?, ?, ?, 1)`,
+      slug, name.slice(0, 200), chamber, now, now,
+    );
+    return this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
+  }
+
   private upsertSource(link: DiscoveredLink): { sourceId: number; isNew: boolean } {
     const now = new Date().toISOString();
     const chamber = link.chamber || "house";
     let politicianId: number | null = null;
     if (chamber === "house") {
-      const name = link.title || link.url;
-      const slug = slugify(name) || `member-${Math.abs(hashStr(link.url))}`;
-      const existingPol = this.ctx.storage.sql
-        .exec<{ id: number }>(`SELECT id FROM politicians WHERE slug = ?`, slug)
-        .toArray();
-      if (existingPol.length > 0) {
-        politicianId = existingPol[0].id;
-        this.ctx.storage.sql.exec(`UPDATE politicians SET last_seen_at = ?, active = 1 WHERE id = ?`, now, politicianId);
-      } else {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO politicians (slug, full_name, chamber, first_seen_at, last_seen_at, active)
-           VALUES (?, ?, 'house', ?, ?, 1)`,
-          slug, name.slice(0, 200), now, now,
-        );
-        politicianId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
-      }
+      politicianId = this.ensurePolitician(link.title || link.url, "house");
     }
     const existingSrc = this.ctx.storage.sql
       .exec<{ id: number }>(
@@ -596,8 +611,14 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     });
     if (!res.ok) throw new Error(`senate volumes HTTP ${res.status}`);
     const html = await res.text();
-    const links = extractSenateVolumeLinks(html, APH_ORIGIN);
-    if (links.length === 0) throw new Error("senate volumes parsed 0 official links");
+    const discovered = extractSenateVolumeLinks(html, APH_ORIGIN);
+    const links: DiscoveredLink[] = [];
+    for (const link of discovered) {
+      const resolved = await resolveSenatePdfUrl(link.url, fetch, FETCH_UA);
+      if (!resolved) continue;
+      links.push({ ...link, url: resolved });
+    }
+    if (links.length === 0) throw new Error("senate volumes parsed 0 fetchable PDFs");
     let sourcesNew = 0;
     let jobsQueued = 0;
     for (const link of links) {
@@ -609,12 +630,33 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
   }
 
   async fetchSource(sourceId: number, sourceUrl: string): Promise<{ sha256: string; skipped: boolean }> {
-    const res = await fetch(sourceUrl, {
-      headers: { "user-agent": FETCH_UA, accept: "application/pdf,*/*" },
+    let url = sourceUrl;
+    let res = await fetch(url, {
+      headers: {
+        "user-agent": FETCH_UA,
+        accept: "application/pdf,*/*",
+        referer: SENATE_VOLUMES_URL,
+      },
+      redirect: "follow",
     });
-    if (!res.ok) throw new Error(`source fetch HTTP ${res.status} for ${sourceUrl}`);
+    if (!res.ok || !((res.headers.get("content-type") || "").toLowerCase().includes("pdf"))) {
+      const resolved = await resolveSenatePdfUrl(url, fetch, FETCH_UA);
+      if (resolved && resolved !== url) {
+        url = resolved;
+        this.ctx.storage.sql.exec(`UPDATE sources SET source_url = ? WHERE id = ?`, url, sourceId);
+        res = await fetch(url, {
+          headers: {
+            "user-agent": FETCH_UA,
+            accept: "application/pdf,*/*",
+            referer: SENATE_VOLUMES_URL,
+          },
+          redirect: "follow",
+        });
+      }
+    }
+    if (!res.ok) throw new Error(`source fetch HTTP ${res.status} for ${url}`);
     const lenHdr = Number(res.headers.get("content-length") || "0");
-    if (lenHdr > 9_000_000) throw new Error(`source too large (${lenHdr} bytes)`);
+    if (lenHdr > 8_000_000) throw new Error(`source too large (${lenHdr} bytes)`);
     const etag = res.headers.get("etag");
     const lastModified = res.headers.get("last-modified");
     const bytes = await res.arrayBuffer();
@@ -640,7 +682,7 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     if (isPdf) {
       this.ctx.storage.sql.exec(
         `INSERT INTO ingestion_jobs (job_type, source_id, source_url, status) VALUES ('parse_version', ?, ?, 'pending')`,
-        sourceId, `${sourceUrl}#v=${versionId}`,
+        sourceId, `${url}#v=${versionId}`,
       );
     }
     return { sha256, skipped: !isPdf };
@@ -682,10 +724,16 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       return { status: "skipped_not_pdf", count: 0 };
     }
     const res = await fetch(src.source_url, {
-      headers: { "user-agent": FETCH_UA, accept: "application/pdf,*/*" },
+      headers: {
+        "user-agent": FETCH_UA,
+        accept: "application/pdf,*/*",
+        referer: SENATE_VOLUMES_URL,
+      },
+      redirect: "follow",
     });
     if (!res.ok) throw new Error(`parse refetch HTTP ${res.status}`);
     const bytes = await res.arrayBuffer();
+    if (bytes.byteLength > 8_000_000) throw new Error(`source too large (${bytes.byteLength} bytes)`);
     const started = new Date().toISOString();
     this.ctx.storage.sql.exec(
       `INSERT INTO parser_runs (source_version_id, model, parser_version, schema_version, started_at, status, input_kind)
@@ -726,7 +774,51 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     if (text.length < 80) {
       throw new Error(`embedded PDF text too short (${text.length} chars)`);
     }
-    text = text.slice(0, 80_000);
+    // Senate volumes are multi-senator; keep more text than a single House form.
+    text = text.slice(0, src.chamber === "senate" ? 180_000 : 80_000);
+
+    if (src.chamber === "senate" && isSenateInterestsForm(text)) {
+      const groups = extractAllSenateDisclosures(text, {
+        parliament: src.parliament || CURRENT_PARLIAMENT,
+      });
+      let inserted = 0;
+      let needsReview = false;
+      let highConfidence = true;
+      const exec = (sql: string, ...params: unknown[]) => this.ctx.storage.sql.exec(sql, ...params);
+      for (const group of groups) {
+        if (group.disclosures.length === 0) continue;
+        const validated = await validateParsedOutput(
+          JSON.stringify({ document: group.document, disclosures: group.disclosures }),
+        );
+        if (!validated.ok || !validated.document || validated.disclosures.length === 0) continue;
+        const politicianId = this.ensurePolitician(group.politicianName, "senate");
+        const committed = this.ctx.storage.transactionSync(() =>
+          commitParsedVersion(exec, {
+            sourceVersionId: versionId,
+            politicianId,
+            parliament: src.parliament,
+            chamber: "senate",
+            lodgedDate: validated.document.lodged_date ?? null,
+            disclosures: validated.disclosures,
+          }),
+        );
+        inserted += committed.inserted;
+        needsReview = needsReview || committed.needsReview || !validated.highConfidence;
+        highConfidence = highConfidence && validated.highConfidence;
+      }
+      if (inserted === 0) throw new Error("senate volume parsed 0 senator records");
+      const parseStatus = needsReview || !highConfidence ? "success_needs_review" : "success";
+      this.ctx.storage.sql.exec(
+        `UPDATE parser_runs SET completed_at = datetime('now'), status = ? WHERE id = ?`,
+        parseStatus, runId,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE source_versions SET parse_status = ?, parse_confidence = ?, disclosure_count = ?, extraction_method = ?,
+          model = ?, model_version = ?, parser_version = ?, schema_version = ?, error_summary = NULL WHERE id = ?`,
+        parseStatus, highConfidence ? 0.85 : 0.5, inserted, "embedded_pdf_text", "senate-form-v1", "senate-form-v1", PARSER_VERSION, SCHEMA_VERSION, versionId,
+      );
+      return { status: parseStatus, count: inserted };
+    }
 
     let rawForValidate = "";
     if (isHouseInterestsForm(text)) {
@@ -982,11 +1074,17 @@ export default {
       if (st.disclosures === 0) {
         await stub.requeueEmptyParses();
       }
-      if ((st.senate_sources ?? 0) === 0) {
+      if ((st.senate_sources ?? 0) === 0 || (st.senate_ok_versions ?? 0) === 0) {
         await stub.enqueueSenateDiscovery();
       }
+      if ((st.senate_sources ?? 0) > 0 && (st.senate_disclosures ?? 0) === 0) {
+        await stub.requeueSenateParses();
+      }
       const mediaFail = (st.recent_errors || []).some(
-        (e: { last_error?: string | null }) => (e.last_error || "").includes("https://media/"),
+        (e: { last_error?: string | null }) => {
+          const err = e.last_error || "";
+          return err.includes("https://media/") || /source fetch HTTP 40[34]/.test(err);
+        },
       );
       if (mediaFail) await stub.enqueueSenateDiscovery();
       await stub.kickAlarm();
