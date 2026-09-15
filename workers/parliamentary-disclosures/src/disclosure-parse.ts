@@ -406,14 +406,18 @@ export function commitParsedVersion(exec: SqlExec, input: CommitInput): {
         disclosureId,
         lowConf ? 1 : 0,
       );
-      exec(
-        "INSERT INTO disclosures_fts (rowid, raw_text, politician_name, entity_names, tags) VALUES (?, ?, ?, ?, ?)",
-        disclosureId,
-        d.raw_text,
-        "",
-        entityNames.join(" "),
-        tagNames.join(" "),
-      );
+      try {
+        exec(
+          "INSERT INTO disclosures_fts (rowid, raw_text, politician_name, entity_names, tags) VALUES (?, ?, ?, ?, ?)",
+          disclosureId,
+          d.raw_text,
+          "",
+          entityNames.join(" "),
+          tagNames.join(" "),
+        );
+      } catch {
+        /* FTS optional */
+      }
     }
   return { inserted, skipped, needsReview: false };
 }

@@ -207,6 +207,11 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     return 1;
   }
 
+  async kickAlarm(): Promise<{ ok: true }> {
+    await this.ctx.storage.setAlarm(Date.now() + 300);
+    return { ok: true };
+  }
+
   async latest(limit = 20) {
     const lim = Math.min(100, Math.max(1, Number(limit) || 20));
     const rows = this.ctx.storage.sql
@@ -806,7 +811,7 @@ export default {
       if (st.sources < 50 && st.pending_jobs === 0) {
         await stub.enqueueDiscovery();
       }
-      await stub.requeueUnknownParseJobs();
+      await stub.kickAlarm();
       return json(await stub.status());
     }
     if (path === "/api/parliamentary-disclosures/search" || path === "/api/search") {
