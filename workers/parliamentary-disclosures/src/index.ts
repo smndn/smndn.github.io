@@ -3,6 +3,7 @@ import { extractText } from "unpdf";
 import { SCHEMA_V1 } from "./schema";
 import { callMuseWithRetry, PARSER_VERSION, SCHEMA_VERSION } from "./muse";
 import { commitParsedVersion, validateParsedOutput } from "./disclosure-parse";
+import { extractHouseFormDisclosures, isHouseInterestsForm } from "./house-form";
 
 export interface Env {
   PARLIAMENTARY_DISCLOSURES: DurableObjectNamespace<ParliamentaryDisclosures>;
@@ -21,7 +22,7 @@ const ALLOWED_SOURCE_HOSTS = new Set([
 ]);
 const CURRENT_PARLIAMENT = 48;
 const MAX_ATTEMPTS = 5;
-const BATCH_SIZE = 1;
+const BATCH_SIZE = 3;
 const FETCH_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -176,6 +177,28 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
   async search(q: string, limit = 25) {
     const query = q.trim();
     if (!query) return { query, results: [] };
+    try {
+      const rows = this.ctx.storage.sql
+        .exec<{
+          id: number;
+          raw_text: string;
+          category: string | null;
+          politician_id: number | null;
+        }>(
+          `SELECT d.id, d.raw_text, d.category, d.politician_id
+           FROM disclosures d
+           JOIN disclosures_fts fts ON fts.rowid = d.id
+           WHERE disclosures_fts MATCH ?
+           LIMIT ?`,
+          query,
+          limit,
+        )
+        .toArray();
+      if (rows.length > 0) return { query, results: rows };
+    } catch {
+      /* FTS optional — LIKE fallback below */
+    }
+    const like = `%${query.replace(/[%_]/g, "")}%`;
     const rows = this.ctx.storage.sql
       .exec<{
         id: number;
@@ -185,10 +208,9 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       }>(
         `SELECT d.id, d.raw_text, d.category, d.politician_id
          FROM disclosures d
-         JOIN disclosures_fts fts ON fts.rowid = d.id
-         WHERE disclosures_fts MATCH ?
+         WHERE d.raw_text LIKE ? COLLATE NOCASE
          LIMIT ?`,
-        query,
+        like,
         limit,
       )
       .toArray();
@@ -198,13 +220,36 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
   async requeueUnknownParseJobs(): Promise<number> {
     this.ctx.storage.sql.exec(
       `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL
-       WHERE status = 'running'`,
+       WHERE status = 'running' AND (started_at IS NULL OR started_at < datetime('now', '-90 seconds'))`,
     );
     this.ctx.storage.sql.exec(
       `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL
        WHERE job_type = 'parse_version' AND status IN ('failed','pending')`,
     );
     await this.ctx.storage.setAlarm(Date.now() + 500);
+    return 1;
+  }
+
+  /** Re-parse completed jobs that stored zero disclosure rows. Does not touch in-flight jobs. */
+  async requeueEmptyParses(): Promise<number> {
+    this.ctx.storage.sql.exec(
+      `UPDATE source_versions SET parse_status = 'pending_parse'
+       WHERE parse_status IN ('success', 'success_needs_review')
+         AND COALESCE(disclosure_count, 0) = 0`,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL, attempts = 0, last_error = NULL
+       WHERE job_type = 'parse_version'
+         AND status = 'completed'
+         AND last_error LIKE '%:0'`,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL, attempts = 0
+       WHERE job_type = 'parse_version'
+         AND status = 'failed'
+         AND last_error LIKE 'validation failed: no disclosure%'`,
+    );
+    await this.ctx.storage.setAlarm(Date.now() + 400);
     return 1;
   }
 
@@ -534,7 +579,13 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       .exec<{ parse_status: string }>(`SELECT parse_status FROM source_versions WHERE id = ?`, versionId)
       .one();
     if (existing.parse_status === "success" || existing.parse_status === "success_needs_review") {
-      return { status: existing.parse_status, count: 0 };
+      const n = this.ctx.storage.sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) as n FROM disclosures WHERE source_version_id = ?`,
+          versionId,
+        )
+        .one().n;
+      if (n > 0) return { status: existing.parse_status, count: n };
     }
     if (!isMemberStatementUrl(src.source_url)) {
       this.ctx.storage.sql.exec(
@@ -551,7 +602,7 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     const started = new Date().toISOString();
     this.ctx.storage.sql.exec(
       `INSERT INTO parser_runs (source_version_id, model, parser_version, schema_version, started_at, status, input_kind)
-       VALUES (?, 'muse-spark-1.3-contributor', ?, ?, ?, 'parsing', 'direct_pdf_model')`,
+       VALUES (?, 'muse-spark-1.3-contributor', ?, ?, ?, 'parsing', 'embedded_pdf_text')`,
       versionId, PARSER_VERSION, SCHEMA_VERSION, started,
     );
     const runId = this.ctx.storage.sql.exec<{ id: number }>(`SELECT last_insert_rowid() as id`).one().id;
@@ -564,12 +615,17 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     const isJsonish = (raw: string) => {
       try {
         const v = JSON.parse(raw);
-        return v && typeof v === "object" && Array.isArray(v.disclosures);
+        return (
+          v &&
+          typeof v === "object" &&
+          Array.isArray(v.disclosures) &&
+          v.disclosures.length > 0
+        );
       } catch {
         return false;
       }
     };
-    let museOut;
+    let museOut: { rawText: string; modelVersion: string | null } | null = null;
     let extractionMethod: "direct_pdf_model" | "embedded_pdf_text" = "embedded_pdf_text";
     let text = "";
     try {
@@ -584,22 +640,35 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       throw new Error(`embedded PDF text too short (${text.length} chars)`);
     }
     text = text.slice(0, 80_000);
-    museOut = await callMuseWithRetry(key, { text, extractionMethod }, meta, isJsonish);
-    let rawForValidate = museOut.rawText;
-    try {
-      const obj = JSON.parse(rawForValidate) as Record<string, unknown>;
-      const doc =
-        obj.document && typeof obj.document === "object"
-          ? { ...(obj.document as Record<string, unknown>) }
-          : {};
-      if (!doc.politician_name || String(doc.politician_name).trim() === "") {
-        doc.politician_name = pol.full_name;
+
+    let rawForValidate = "";
+    if (isHouseInterestsForm(text)) {
+      const extracted = extractHouseFormDisclosures(text, meta);
+      if (extracted.disclosures.length > 0) {
+        rawForValidate = JSON.stringify(extracted);
+        extractionMethod = "embedded_pdf_text";
+        museOut = { rawText: rawForValidate, modelVersion: "house-form-v1" };
       }
-      obj.document = doc;
-      rawForValidate = JSON.stringify(obj);
-    } catch {
-      /* validateParsedOutput will reject */
     }
+    if (!rawForValidate) {
+      museOut = await callMuseWithRetry(key, { text, extractionMethod }, meta, isJsonish);
+      rawForValidate = museOut.rawText;
+      try {
+        const obj = JSON.parse(rawForValidate) as Record<string, unknown>;
+        const doc =
+          obj.document && typeof obj.document === "object"
+            ? { ...(obj.document as Record<string, unknown>) }
+            : {};
+        if (!doc.politician_name || String(doc.politician_name).trim() === "") {
+          doc.politician_name = pol.full_name;
+        }
+        obj.document = doc;
+        rawForValidate = JSON.stringify(obj);
+      } catch {
+        /* validateParsedOutput will reject */
+      }
+    }
+    if (!museOut) throw new Error("parser produced no output");
     const validated = await validateParsedOutput(rawForValidate);
     if (!validated.ok || !validated.document) {
       throw new Error(`validation failed: ${validated.errors.join("; ")}`);
@@ -705,7 +774,7 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     if (remaining.n > 0) {
       const delay = remaining.next_at
         ? Math.max(1000, Math.min(15 * 60 * 1000, new Date(remaining.next_at).getTime() - Date.now()))
-        : 15_000;
+        : 1_000;
       await this.ctx.storage.setAlarm(Date.now() + (Number.isFinite(delay) ? delay : 15_000));
     }
   }
@@ -815,6 +884,9 @@ export default {
       const st = await stub.status();
       if (st.sources < 50 && st.pending_jobs === 0) {
         await stub.enqueueDiscovery();
+      }
+      if (st.disclosures === 0) {
+        await stub.requeueEmptyParses();
       }
       await stub.kickAlarm();
       return json(await stub.status());

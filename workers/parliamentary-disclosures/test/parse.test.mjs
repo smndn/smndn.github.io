@@ -74,20 +74,20 @@ test("malformed JSON rejected", async () => {
   assert.match(r.errors.join(";"), /malformed JSON/);
 });
 
-test("invalid category rejected", async () => {
+test("unknown category coerced to other_interests", async () => {
   const doc = JSON.parse(VALID_DOC);
   doc.disclosures[0].category = "freebies";
   const r = await validateParsedOutput(JSON.stringify(doc));
-  assert.equal(r.ok, false);
-  assert.match(r.errors.join(";"), /category/);
+  assert.equal(r.ok, true);
+  assert.equal(r.disclosures[0].category, "other_interests");
 });
 
-test("invalid event_type rejected", async () => {
+test("unknown event_type coerced to unknown", async () => {
   const doc = JSON.parse(VALID_DOC);
   doc.disclosures[0].event_type = "maybe_added";
   const r = await validateParsedOutput(JSON.stringify(doc));
-  assert.equal(r.ok, false);
-  assert.match(r.errors.join(";"), /event_type/);
+  assert.equal(r.ok, true);
+  assert.equal(r.disclosures[0].event_type, "unknown");
 });
 
 test("impossible + out-of-range dates rejected", async () => {
@@ -101,10 +101,11 @@ test("impossible + out-of-range dates rejected", async () => {
   assert.equal(r.ok, false);
 });
 
-test("empty raw_text rejected", async () => {
-  const doc = JSON.parse(VALID_DOC);
-  doc.disclosures[0].raw_text = "   ";
-  const r = await validateParsedOutput(JSON.stringify(doc));
+test("empty raw_text rejected when no wording aliases exist", async () => {
+  const r = await validateParsedOutput(JSON.stringify({
+    document: { politician_name: "X" },
+    disclosures: [{ category: "gifts", event_type: "initial", raw_text: "   " }],
+  }));
   assert.equal(r.ok, false);
   assert.match(r.errors.join(";"), /raw_text/);
 });

@@ -12,7 +12,7 @@
 
 export const MUSE_API_URL = "https://api.meta.ai/v1";
 export const MUSE_MODEL = "muse-spark-1.3-contributor";
-export const PARSER_VERSION = "pd-parser-v1";
+export const PARSER_VERSION = "pd-parser-v2";
 export const SCHEMA_VERSION = "pd-schema-v1";
 
 export type ExtractionMethod =
@@ -50,8 +50,10 @@ export class MuseParseError extends Error {
 }
 
 const SYSTEM_PROMPT = `You extract Australian federal parliamentary disclosure records into strict JSON.
+The user message contains DOCUMENT TEXT plus context. Context is not a disclosure. Do not echo Politician/Chamber/Parliament/Source/Extraction method as the result.
 Rules:
-- Extract EVERY disclosure item, including NIL / Not Applicable / blank entries. Never omit boring records.
+- disclosures MUST be a non-empty array. An empty array is invalid.
+- Extract EVERY numbered form row for Self, Spouse/Partner and Dependent Children, including NIL / Not Applicable. Never omit boring records.
 - Preserve the EXACT original wording in raw_text. Do not summarise, editorialise, or invent details.
 - Preserve additions, deletions, amendments and corrections as separate events with event_type initial|addition|deletion|alteration|amendment|correction|unknown.
 - Preserve the person/relationship (subject), relevant dates, source page, named entities, and categories.
@@ -59,7 +61,9 @@ Rules:
 - Never infer motives, corruption, solicitation, taxpayer funding, market value, or whether an upgrade was requested unless the source wording states it.
 - Never merge ambiguous additions and deletions. Prefer unknown over unjustified inference.
 - confidence is 0..1 per disclosure. Use low confidence rather than guessing.
-Return ONLY a JSON object matching the caller's schema. No markdown, no commentary.`;
+Return ONLY this JSON shape:
+{"document":{"politician_name":"...","chamber":"house","parliament":48},"disclosures":[{"category":"memberships","event_type":"initial","subject":"self","raw_text":"EXACT SOURCE WORDING","confidence":0.9}]}
+No markdown, no commentary.`;
 
 export function buildUserPrompt(
   input: MuseParseInput,
@@ -73,9 +77,9 @@ export function buildUserPrompt(
     `Extraction method: ${input.extractionMethod}`,
   ].join("\n");
   if (input.text && input.text.length > 0) {
-    return `${header}\n\nDocument text:\n${input.text}`;
+    return `DOCUMENT TEXT:\n${input.text}\n\nCONTEXT (metadata only — do not copy these fields as the JSON result):\n${header}\n\nExtract every form row including NIL / Not Applicable into disclosures[]. Empty disclosures is invalid.`;
   }
-  return `${header}\n\nDocument is attached as PDF (${input.pdfFilename || "source.pdf"}). Extract all disclosures.`;
+  return `${header}\n\nDocument is attached as PDF (${input.pdfFilename || "source.pdf"}). Extract every form row including NIL into disclosures[]. Empty disclosures is invalid.`;
 }
 
 interface ChatMessage {
@@ -224,7 +228,7 @@ export async function callMuseWithRetry(
       input = {
         ...input,
         text: input.text
-          ? `${input.text}\n\nREMINDER: return ONLY strict JSON. raw_text must be the exact source wording, character for character.`
+          ? `${input.text}\n\nREMINDER: return ONLY strict JSON with a non-empty disclosures array. Each numbered form section needs at least one row per person (Self/Spouse/Dependent Children), including NIL / Not Applicable. raw_text must be the exact source wording.`
           : undefined,
       };
     }
