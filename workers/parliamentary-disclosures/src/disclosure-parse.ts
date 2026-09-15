@@ -143,6 +143,9 @@ function validateDisclosure(
   errors: string[],
 ): ParsedDisclosure | null {
   const tag = `disclosures[${index}]`;
+  if (typeof item === "string" && item.trim()) {
+    item = { raw_text: item, category: "other_interests", event_type: "unknown" };
+  }
   if (!isRecord(item)) {
     errors.push(`${tag}: not an object`);
     return null;
@@ -186,12 +189,22 @@ function validateDisclosure(
   }
   let rawText = item["raw_text"];
   if (typeof rawText !== "string" || rawText.trim().length === 0) {
-    for (const k of ["text", "wording", "source_text", "exact_text", "content"]) {
+    for (const k of ["text", "wording", "source_text", "exact_text", "content", "description", "details", "interest", "item", "declaration", "value"]) {
       if (typeof item[k] === "string" && String(item[k]).trim()) {
         rawText = item[k];
         item["raw_text"] = rawText;
         break;
       }
+    }
+  }
+  if (typeof rawText !== "string" || rawText.trim().length === 0) {
+    const blob = Object.entries(item)
+      .filter(([k, v]) => typeof v === "string" && String(v).trim().length > 8 && k !== "category" && k !== "event_type")
+      .map(([, v]) => v as string)
+      .join("\n");
+    if (blob.trim().length > 8) {
+      rawText = blob;
+      item["raw_text"] = rawText;
     }
   }
   if (typeof rawText !== "string" || rawText.trim().length === 0) {
@@ -262,7 +275,9 @@ export async function validateParsedOutput(
       errors.push(`document.lodged_date: invalid '${String(doc["lodged_date"])}'`);
     }
   }
-  const list = value["disclosures"];
+  let list = value["disclosures"];
+  if (!Array.isArray(list)) list = value["items"];
+  if (!Array.isArray(list)) list = value["records"];
   if (!Array.isArray(list)) {
     errors.push("disclosures: required array");
     return {
