@@ -130,8 +130,11 @@ export function extractSenateVolumeLinks(html: string, base = APH_ORIGIN): Disco
     if (!/2025|2026/.test(title)) continue;
     if (volumeTooLarge(title)) continue;
     let href = (m[1] || "").trim().replace(/^~/, "");
-    if (href.startsWith("-/")) href = "/" + href.slice(1);
-    if (!href.startsWith("/")) href = "/" + href.replace(/^\//, "");
+    href = href.replace(/^-\//, "/");
+    if (href.toLowerCase().startsWith("/media/")) href = "/-" + href;
+    if (!href.startsWith("http")) {
+      if (!href.startsWith("/")) href = "/" + href;
+    }
     let absolute: string;
     try {
       absolute = new URL(href, base).toString();
