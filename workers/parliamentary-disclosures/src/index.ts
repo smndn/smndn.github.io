@@ -598,14 +598,16 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       throw new Error(`validation failed: ${validated.errors.join("; ")}`);
     }
     const exec = (sql: string, ...params: unknown[]) => this.ctx.storage.sql.exec(sql, ...params);
-    const committed = commitParsedVersion(exec, {
-      sourceVersionId: versionId,
-      politicianId: src.politician_id,
-      parliament: src.parliament,
-      chamber: src.chamber,
-      lodgedDate: validated.document.lodged_date ?? null,
-      disclosures: validated.disclosures,
-    });
+    const committed = this.ctx.storage.transactionSync(() =>
+      commitParsedVersion(exec, {
+        sourceVersionId: versionId,
+        politicianId: src.politician_id,
+        parliament: src.parliament,
+        chamber: src.chamber,
+        lodgedDate: validated.document.lodged_date ?? null,
+        disclosures: validated.disclosures,
+      }),
+    );
     const parseStatus = committed.needsReview || !validated.highConfidence ? "success_needs_review" : "success";
     this.ctx.storage.sql.exec(
       `UPDATE parser_runs SET completed_at = datetime('now'), status = ? WHERE id = ?`,

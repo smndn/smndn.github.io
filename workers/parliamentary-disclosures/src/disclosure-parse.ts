@@ -303,9 +303,7 @@ export function commitParsedVersion(exec: SqlExec, input: CommitInput): {
 } {
   let inserted = 0;
   let skipped = 0;
-  exec("BEGIN");
-  try {
-    for (const d of input.disclosures) {
+  for (const d of input.disclosures) {
       const before = (exec(
         "SELECT COUNT(*) as n FROM disclosures WHERE source_version_id = ? AND category = ? AND event_type = ? AND raw_text_hash = ? AND " +
           (input.politicianId === null
@@ -417,14 +415,5 @@ export function commitParsedVersion(exec: SqlExec, input: CommitInput): {
         tagNames.join(" "),
       );
     }
-    exec("COMMIT");
-  } catch (err) {
-    try {
-      exec("ROLLBACK");
-    } catch {
-      /* best effort */
-    }
-    throw err;
-  }
   return { inserted, skipped, needsReview: false };
 }
