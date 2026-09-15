@@ -20,7 +20,7 @@ const ALLOWED_SOURCE_HOSTS = new Set([
 ]);
 const CURRENT_PARLIAMENT = 48;
 const MAX_ATTEMPTS = 5;
-const BATCH_SIZE = 3;
+const BATCH_SIZE = 1;
 const FETCH_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -104,7 +104,7 @@ export function extractHouseLinks(html: string, base = APH_ORIGIN): DiscoveredLi
 }
 
 function backoffMs(attempts: number): number {
-  return Math.min(60 * 60 * 1000, 30_000 * Math.pow(2, Math.max(0, attempts - 1)));
+  return Math.min(15_000, 5_000 * Math.pow(2, Math.max(0, attempts - 1)));
 }
 
 async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
@@ -195,19 +195,16 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
   }
 
   async requeueUnknownParseJobs(): Promise<number> {
-    const rows = this.ctx.storage.sql
-      .exec<{ id: number }>(
-        `SELECT id FROM ingestion_jobs WHERE job_type = 'parse_version' AND status = 'failed' AND last_error = 'unknown job_type parse_version'`,
-      )
-      .toArray();
-    for (const r of rows) {
-      this.ctx.storage.sql.exec(
-        `UPDATE ingestion_jobs SET status = 'pending', last_error = NULL, next_retry_at = NULL WHERE id = ?`,
-        r.id,
-      );
-    }
-    if (rows.length > 0) await this.ctx.storage.setAlarm(Date.now() + 1000);
-    return rows.length;
+    this.ctx.storage.sql.exec(
+      `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL
+       WHERE status = 'running'`,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL
+       WHERE job_type = 'parse_version' AND status IN ('failed','pending')`,
+    );
+    await this.ctx.storage.setAlarm(Date.now() + 500);
+    return 1;
   }
 
   async latest(limit = 20) {
@@ -533,6 +530,13 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     if (existing.parse_status === "success" || existing.parse_status === "success_needs_review") {
       return { status: existing.parse_status, count: 0 };
     }
+    if (!isMemberStatementUrl(src.source_url)) {
+      this.ctx.storage.sql.exec(
+        `UPDATE source_versions SET parse_status = 'skipped_not_pdf' WHERE id = ?`,
+        versionId,
+      );
+      return { status: "skipped_not_pdf", count: 0 };
+    }
     const res = await fetch(src.source_url, {
       headers: { "user-agent": FETCH_UA, accept: "application/pdf,*/*" },
     });
@@ -631,12 +635,17 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    this.ctx.storage.sql.exec(
+      `UPDATE ingestion_jobs SET status = 'pending', next_retry_at = NULL
+       WHERE status = 'running' AND (started_at IS NULL OR started_at < datetime('now', '-90 seconds'))`,
+    );
     const now = new Date().toISOString();
     const jobs = this.ctx.storage.sql
       .exec<{ id: number; job_type: string; source_id: number | null; source_url: string | null; attempts: number }>(
         `SELECT id, job_type, source_id, source_url, attempts FROM ingestion_jobs
          WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
-         ORDER BY id ASC LIMIT ?`,
+         ORDER BY CASE job_type WHEN 'parse_version' THEN 0 WHEN 'fetch_source' THEN 1 ELSE 2 END, id ASC
+         LIMIT ?`,
         now, BATCH_SIZE,
       )
       .toArray();

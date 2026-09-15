@@ -204,11 +204,12 @@ export async function callMuseWithRetry(
   meta: MuseParseMeta,
   isValid: (rawText: string) => boolean,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs = 45_000,
 ): Promise<{ rawText: string; modelVersion: string | null; attempts: number }> {
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const out = await callMuse(apiKey, input, meta, fetchImpl);
+      const out = await callMuse(apiKey, input, meta, fetchImpl, timeoutMs);
       if (isValid(out.rawText)) return { ...out, attempts: attempt };
       lastError = new MuseParseError(
         `muse output failed validation (attempt ${attempt})`,
