@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { extractText } from "unpdf";
 import { SCHEMA_V1 } from "./schema";
 import { callMuseWithRetry, PARSER_VERSION, SCHEMA_VERSION } from "./muse";
 import { commitParsedVersion, validateParsedOutput } from "./disclosure-parse";
@@ -570,10 +571,19 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
     };
     let museOut;
     let extractionMethod: "direct_pdf_model" | "embedded_pdf_text" = "embedded_pdf_text";
-    const text = extractEmbeddedPdfText(bytes);
+    let text = "";
+    try {
+      const extracted = await extractText(new Uint8Array(bytes));
+      const raw = (extracted as { text?: unknown }).text;
+      text = Array.isArray(raw) ? raw.join("\n") : String(raw ?? "");
+    } catch {
+      text = extractEmbeddedPdfText(bytes);
+    }
+    text = text.replace(/\u0000/g, " ").replace(/[ \t]+\n/g, "\n").trim();
     if (text.length < 80) {
       throw new Error(`embedded PDF text too short (${text.length} chars)`);
     }
+    text = text.slice(0, 80_000);
     museOut = await callMuseWithRetry(key, { text, extractionMethod }, meta, isJsonish);
     let rawForValidate = museOut.rawText;
     try {
@@ -595,7 +605,7 @@ export class ParliamentaryDisclosures extends DurableObject<Env> {
       throw new Error(`validation failed: ${validated.errors.join("; ")}`);
     }
     if (validated.disclosures.length === 0) {
-      throw new Error("validation failed: no disclosure items");
+      throw new Error(`validation failed: no disclosure items :: ${rawForValidate.slice(0, 400)}`);
     }
     const exec = (sql: string, ...params: unknown[]) => this.ctx.storage.sql.exec(sql, ...params);
     const committed = this.ctx.storage.transactionSync(() =>
